@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sonarr/Radarr "On Import" custom script.
-# Dopo che l'app sposta il file da torrents/ alla media library,
-# qui ricreiamo un symlink relativo nel path originale del torrent
-# in modo che qBittorrent possa continuare a seedare leggendo dal
-# file (reale) nella media library.
+# After the *arr app has moved the file from torrents/ into the media
+# library, recreate a relative symlink at the original torrent path so
+# qBittorrent can keep seeding by reading the (real) file in the media
+# library.
 
 set -euo pipefail
 

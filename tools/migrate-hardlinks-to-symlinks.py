@@ -8,6 +8,13 @@ media library, replaces it atomically with a relative symlink.
 
 Files in torrents/ whose inode is NOT in the media library (link count 1,
 or hardlinked elsewhere only) are left untouched.
+
+Example:
+    migrate-hardlinks-to-symlinks.py \\
+        --torrents-root /mnt/media/storage/torrents \\
+        --media-root    /mnt/media/storage/Movies   \\
+        --media-root    /mnt/media/storage/TV       \\
+        --apply
 """
 
 import argparse
@@ -15,15 +22,6 @@ import os
 import sys
 import time
 from pathlib import Path
-
-TORRENTS_ROOT = Path("/mnt/media/storage/torrents")
-MEDIA_LIB_ROOTS = [
-    Path("/mnt/media/storage/Films"),
-    Path("/mnt/media/storage/SerieTV"),
-    Path("/mnt/media/storage/Musica"),
-    Path("/mnt/media/storage/Libri"),
-    Path("/mnt/media/storage/RegistrazioniTV"),
-]
 
 
 def build_inode_map(roots: list[Path]) -> dict[int, list[Path]]:
@@ -57,7 +55,16 @@ def replace_atomically(path: Path, rel_target: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--torrents-root", type=Path, required=True,
+                    help="root of the qBittorrent download/seed directory to migrate")
+    ap.add_argument("--media-root", type=Path, action="append", required=True,
+                    dest="media_roots", metavar="PATH",
+                    help="media library subtree to scan for hardlink targets "
+                         "(repeat for multiple roots, e.g. Movies, TV)")
     ap.add_argument("--apply", action="store_true",
                     help="actually perform the migration (default: dry-run)")
     ap.add_argument("--limit", type=int, default=0,
@@ -67,11 +74,12 @@ def main():
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] building inode map from media library...")
     t0 = time.time()
-    inode_map = build_inode_map(MEDIA_LIB_ROOTS)
+    inode_map = build_inode_map(args.media_roots)
     print(f"  total unique inodes: {len(inode_map)} ({time.time()-t0:.1f}s)")
     print()
 
-    print(f"[{mode}] scanning {TORRENTS_ROOT}...")
+    torrents_root: Path = args.torrents_root
+    print(f"[{mode}] scanning {torrents_root}...")
     stats = {
         "files": 0,
         "symlink": 0,
@@ -81,7 +89,7 @@ def main():
         "errors": 0,
     }
     t0 = time.time()
-    for f in TORRENTS_ROOT.rglob("*"):
+    for f in torrents_root.rglob("*"):
         if "/.Trash" in str(f):
             continue
         try:

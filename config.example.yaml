@@ -50,8 +50,8 @@ instances:
 
   # Uncomment for a second instance (e.g. a standalone qB next to a
   # VPN-routed one). Each instance has its own path_map.
-  # - name: qbittorrentaf
-  #   url: http://qbittorrentaf:8181
+  # - name: qbittorrent-direct
+  #   url: http://qbittorrent-direct:8181
   #   username: admin
   #   password: CHANGE_ME
   #   path_map:

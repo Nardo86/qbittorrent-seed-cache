@@ -10,7 +10,7 @@ Hot/cold tiering daemon for qBittorrent seeds: keep an SSD copy of the most acti
 
 Given:
 
-- a **bulk** filesystem where the real media files live (`Films/...`, `SerieTV/...`) — typically a NAS over NFS,
+- a **bulk** filesystem where the real media files live (`Movies/...`, `TV/...`) — typically a NAS over NFS,
 - a **torrents** directory used by qBittorrent as the download/seed path, where every entry is a symlink to the bulk file (set up via the included [`tools/post-import.sh`](tools/post-import.sh)),
 - a small **SSD** cache directory with the *same absolute path* on host and inside every relevant container (`/var/lib/seed-cache` by default),
 

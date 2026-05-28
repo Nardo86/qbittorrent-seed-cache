@@ -39,9 +39,7 @@ Crash between step 3 and step 4: orphan SSD content. Cleaned up on next tick.
 
 ## Multi-qB
 
-When two qB instances share the same content (e.g. one VPN, one direct), the `torrents/<release>/<file>` paths are *different* (different download dirs), but the symlink targets (bulk file or SSD copy) can be **the same**. The mover tracks tier state per `(instance, infohash)`, so each qB's symlink is retargeted independently — but a single SSD copy can back multiple symlinks. Disk accounting is therefore tracked by infohash, not by `(instance, infohash)`, to avoid double-counting.
-
-> Status: the multi-qB consolidation logic is not yet implemented in the scaffold. The first version will treat each (instance, infohash) independently, duplicating SSD bytes if the same content is in two qB instances. A follow-up will deduplicate by `infohash`.
+When two qB instances share the same content (e.g. one VPN, one direct), the `torrents/<release>/<file>` paths are *different* (different download dirs), but the symlink targets (bulk file or SSD copy) can be **the same**. Tier state is tracked **per-infohash** (not per `(instance, infohash)`), so a single SSD copy can back multiple symlinks across instances. Disk accounting is by infohash, so the same content in two qB instances does not double-count against the quota. When the mover promotes a hot torrent, every instance that holds the same infohash gets its symlink retargeted in lockstep.
 
 ## Failure modes
 

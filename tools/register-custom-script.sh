@@ -4,13 +4,13 @@
 # not in YAML, so we configure it via the REST API.
 #
 # Usage:
-#   ./register-custom-script.sh sonarr   http://localhost:8989 /path/to/config.xml /docker/scripts/post-import.sh
-#   ./register-custom-script.sh radarr   http://localhost:7878 /path/to/config.xml /docker/scripts/post-import.sh
+#   ./register-custom-script.sh sonarr http://localhost:8989 /path/to/config.xml /in-container/path/to/post-import.sh
+#   ./register-custom-script.sh radarr http://localhost:7878 /path/to/config.xml /in-container/path/to/post-import.sh
 #
 # Argument 3 is the path to the Sonarr/Radarr `config.xml` (used to read
 # the API key non-interactively). Argument 4 is the path where the
-# container will execute post-import.sh — i.e. an *in-container* path,
-# typically /docker/scripts/post-import.sh.
+# *arr container will execute post-import.sh — i.e. an *in-container*
+# path; mount tools/ into the container and pass that mount point here.
 
 set -euo pipefail
 
