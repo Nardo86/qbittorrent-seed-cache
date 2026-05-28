@@ -14,6 +14,10 @@ class InstanceConfig(BaseModel):
     url: str
     username: str
     password: SecretStr
+    # Map container-side absolute paths (as seen by qB) to host-side absolute
+    # paths (as seen by the mover). Longest-prefix match wins. The mover's
+    # bind-mount layout must allow the host-side paths to be resolved.
+    path_map: dict[str, str] = {}
 
 
 class HotnessConfig(BaseModel):

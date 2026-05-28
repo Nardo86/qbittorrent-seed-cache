@@ -36,13 +36,20 @@ instances:
     url: http://qbittorrent:8080
     username: admin
     password: CHANGE_ME
+    # qB sees the bulk filesystem as /data; the mover sees the same files
+    # at /mnt/media/storage. The mover applies this map to translate every
+    # absolute path qB returns (save_path, content_path, file names).
+    path_map:
+      "/data": "/mnt/media/storage"
 
   # Uncomment for a second instance (e.g. a standalone qB next to a
-  # VPN-routed one):
+  # VPN-routed one). Each instance has its own path_map.
   # - name: qbittorrentaf
   #   url: http://qbittorrentaf:8181
   #   username: admin
   #   password: CHANGE_ME
+  #   path_map:
+  #     "/data": "/mnt/media/storage"
 
 # --- Hotness scoring ------------------------------------------------------
 hotness:
