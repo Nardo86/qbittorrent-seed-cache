@@ -1,26 +1,29 @@
-"""Promotion/demotion primitives.
+"""Promotion/demotion of a *logical* torrent (one infohash, N instances).
 
-A torrent's content_path (from qB) is a path *inside* the qB container.
-Both qB and the mover see the same absolute path for `ssd_cache_dir` and
-the same absolute path for the bulk filesystem (bind-mount discipline).
-The symlink in `torrents/<release>/<file>` itself is what qB resolves at
-seed time, so retargeting it is sufficient — qB does not cache the inode.
+The SSD cache stores one copy per infohash at `ssd_cache_dir/<infohash>/...`,
+shared by all qB instances that hold that infohash. Each instance has its
+own symlinks in its own `torrents/<release>/` dir; the mover retargets all
+of them in lockstep.
 
-Cold → Hot:
-  1. Compute SSD destination: ssd_cache_dir / <infohash> / <relative content>
-  2. Copy bulk → ssd (atomic via tmp + rename).
-  3. Retarget link → ssd (atomic).
+Cold → Hot (`promote`):
+  1. For each unique SSD destination path among the layouts, copy bulk→SSD
+     once. The copy is atomic (tmp + rename) and skipped if the destination
+     already exists with the right size (resumes after a crash).
+  2. Retarget every layout's symlink to its (absolute) SSD destination.
 
-Hot → Cold:
-  1. Retarget link → bulk (atomic, relative target preferred when on the
-     same fs as the link).
-  2. rm -rf ssd_cache_dir / <infohash>.
+Hot → Cold (`demote`):
+  1. Retarget every layout's symlink to a relative path into the bulk
+     filesystem.
+  2. Remove the SSD `<infohash>/` directory once.
+
+Both helpers expect every layout in the list to share the same infohash.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import structlog
 
@@ -31,7 +34,7 @@ log = structlog.get_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class TorrentLayout:
-    """Resolved paths for a single torrent."""
+    """Per-file resolved paths within one qB instance."""
 
     instance: str
     infohash: str
@@ -39,52 +42,119 @@ class TorrentLayout:
     link: Path
     # The real file in the bulk filesystem (NFS/HDD).
     bulk_target: Path
-    # The SSD copy path. Exists only when the torrent is hot.
+    # The SSD copy path. Same for every instance with this infohash+rel.
     ssd_target: Path
 
 
-def promote(layout: TorrentLayout, *, dry_run: bool = False) -> int:
-    """Copy bulk → SSD and retarget the symlink. Returns bytes copied."""
-    size = layout.bulk_target.stat().st_size
-    log.info(
-        "promote.start",
-        instance=layout.instance,
-        infohash=layout.infohash,
-        bytes=size,
-        link=str(layout.link),
-        bulk=str(layout.bulk_target),
-        ssd=str(layout.ssd_target),
-        dry_run=dry_run,
+def _check_single_infohash(layouts: Iterable[TorrentLayout]) -> str:
+    infohashes = {layout.infohash for layout in layouts}
+    if len(infohashes) != 1:
+        raise ValueError(f"layouts must share a single infohash, got {infohashes}")
+    return next(iter(infohashes))
+
+
+def _ssd_root(layout: TorrentLayout) -> Path:
+    """Return the <ssd_cache_dir>/<infohash>/ directory containing ssd_target.
+
+    Since ssd_target = ssd_cache_dir / infohash / <rel>, the wanted dir is
+    the ancestor whose own basename equals the infohash.
+    """
+    for parent in layout.ssd_target.parents:
+        if parent.name == layout.infohash:
+            return parent
+    raise ValueError(
+        f"ssd_target {layout.ssd_target} does not contain infohash dir {layout.infohash!r}"
     )
-    if dry_run:
-        return size
-
-    safe_copy(layout.bulk_target, layout.ssd_target)
-    atomic_retarget(layout.link, layout.ssd_target)  # absolute target (cross-fs)
-    log.info("promote.ok", instance=layout.instance, infohash=layout.infohash, bytes=size)
-    return size
 
 
-def demote(layout: TorrentLayout, *, dry_run: bool = False) -> int:
-    """Retarget the symlink back to bulk and drop the SSD copy. Returns bytes freed."""
+def promote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
+    """Promote a logical torrent to the SSD. Returns bytes copied (sum of unique destinations).
+
+    Idempotent w.r.t. SSD content: if the SSD copy already exists with the
+    right size, only the symlinks are retargeted.
+    """
+    if not layouts:
+        return 0
+    infohash = _check_single_infohash(layouts)
+
+    # Group by SSD destination to dedup copies across instances sharing the
+    # same infohash.
+    by_dest: dict[Path, TorrentLayout] = {}
+    for layout in layouts:
+        by_dest.setdefault(layout.ssd_target, layout)
+
+    total = 0
+    for dest, layout in by_dest.items():
+        size = layout.bulk_target.stat().st_size
+        if dest.exists() and dest.stat().st_size == size:
+            log.info(
+                "promote.copy_skip",
+                infohash=infohash,
+                ssd=str(dest),
+                bytes=size,
+            )
+        else:
+            log.info(
+                "promote.copy",
+                infohash=infohash,
+                bulk=str(layout.bulk_target),
+                ssd=str(dest),
+                bytes=size,
+                dry_run=dry_run,
+            )
+            if not dry_run:
+                safe_copy(layout.bulk_target, dest)
+        total += size
+
+    for layout in layouts:
+        log.info(
+            "promote.retarget",
+            instance=layout.instance,
+            infohash=infohash,
+            link=str(layout.link),
+            ssd=str(layout.ssd_target),
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            atomic_retarget(layout.link, layout.ssd_target)
+
+    log.info("promote.ok", infohash=infohash, instances=sorted({layout.instance for layout in layouts}), bytes=total)
+    return total
+
+
+def demote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
+    """Demote a logical torrent: retarget all symlinks to bulk, drop SSD copy."""
+    if not layouts:
+        return 0
+    infohash = _check_single_infohash(layouts)
+
     freed = 0
-    if layout.ssd_target.exists():
-        freed = layout.ssd_target.stat().st_size
+    # Sum the unique SSD bytes (one copy per (infohash, rel file)).
+    seen: set[Path] = set()
+    for layout in layouts:
+        if layout.ssd_target in seen:
+            continue
+        seen.add(layout.ssd_target)
+        if layout.ssd_target.exists():
+            freed += layout.ssd_target.stat().st_size
 
-    log.info(
-        "demote.start",
-        instance=layout.instance,
-        infohash=layout.infohash,
-        bytes=freed,
-        link=str(layout.link),
-        bulk=str(layout.bulk_target),
-        dry_run=dry_run,
-    )
-    if dry_run:
-        return freed
+    for layout in layouts:
+        rel = relative_target(layout.link.parent, layout.bulk_target)
+        log.info(
+            "demote.retarget",
+            instance=layout.instance,
+            infohash=infohash,
+            link=str(layout.link),
+            bulk=str(layout.bulk_target),
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            atomic_retarget(layout.link, rel)
 
-    rel = relative_target(layout.link.parent, layout.bulk_target)
-    atomic_retarget(layout.link, rel)
-    remove_tree(layout.ssd_target.parent)  # remove <infohash>/ dir
-    log.info("demote.ok", instance=layout.instance, infohash=layout.infohash, bytes=freed)
+    ssd_root = _ssd_root(layouts[0])
+    log.info("demote.rm_ssd", infohash=infohash, ssd_root=str(ssd_root), bytes=freed, dry_run=dry_run)
+    if not dry_run:
+        remove_tree(ssd_root)
+
+    log.info("demote.ok", infohash=infohash, instances=sorted({layout.instance for layout in layouts}), bytes=freed)
     return freed

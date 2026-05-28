@@ -21,7 +21,6 @@ def _cand(
     now: int = 10_000,
 ) -> TorrentCandidate:
     return TorrentCandidate(
-        instance="qb",
         infohash=name,
         size_bytes=int(size_gb * GB),
         score=HotnessScore(
@@ -31,6 +30,7 @@ def _cand(
         ),
         current_tier=tier,
         tier_since_ts=now - age_sec,
+        instances=("qb",),
     )
 
 

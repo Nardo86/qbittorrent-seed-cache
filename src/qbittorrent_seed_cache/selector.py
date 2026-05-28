@@ -4,7 +4,12 @@ Kept free of I/O so it's trivially unit-testable. The daemon glues it to
 the StateStore and the QbitClient.
 
 Thresholds are configured as MB/day; we compare against the per-day rate
-from HotnessScore.upload_bytes_per_day (bytes/sec * 86400 / 1024**2 ≈ MB/day).
+from HotnessScore.upload_bytes_per_day (bytes / second → MB / day).
+
+Candidates are *logical* (per-infohash), not per (instance, infohash). When
+the same infohash is seeded by multiple qB instances, hotness scores are
+summed by the caller and the candidate carries the list of instances for
+traceability.
 """
 
 from __future__ import annotations
@@ -16,9 +21,8 @@ from .hotness import HotnessScore
 
 @dataclass(frozen=True, slots=True)
 class TorrentCandidate:
-    """Aggregated view of one torrent for selection purposes."""
+    """Aggregated view of one *logical* torrent (infohash) for selection."""
 
-    instance: str
     infohash: str
     size_bytes: int
     score: HotnessScore
@@ -26,6 +30,9 @@ class TorrentCandidate:
     current_tier: str | None
     # Unix ts when current_tier was assigned (0 if unknown).
     tier_since_ts: int
+    # qB instance names hosting this infohash. Informational; the selector
+    # does not use it.
+    instances: tuple[str, ...] = ()
 
 
 def _per_day_mb(score: HotnessScore) -> float:

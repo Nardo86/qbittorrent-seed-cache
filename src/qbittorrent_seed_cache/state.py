@@ -1,11 +1,13 @@
 """SQLite-backed rolling-window upload state.
 
-We poll qB once per tick and store a snapshot per (instance, infohash):
-    ts, uploaded_session, upspeed
+Snapshot metrics are stored per (instance, infohash) — each qB instance has
+its own counters that may reset independently. Tier state is *logical*,
+keyed by infohash only: the SSD copy exists at most once per infohash and
+is shared by all instances seeding that infohash.
 
 uploaded_session resets when qB restarts. We detect resets (current < previous)
-and treat the new value as the delta from zero. The rolling-window EMA is
-computed in hotness.py from the deltas between consecutive snapshots.
+and treat the new value as the delta from zero. The rolling-window score
+is computed in hotness.py from the deltas between consecutive snapshots.
 """
 
 from __future__ import annotations
@@ -31,12 +33,10 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_recent
     ON snapshots (instance, infohash, ts DESC);
 
 CREATE TABLE IF NOT EXISTS tier (
-    instance     TEXT    NOT NULL,
-    infohash     TEXT    NOT NULL,
-    tier         TEXT    NOT NULL CHECK (tier IN ('cold','hot')),
-    since_ts     INTEGER NOT NULL,
-    ssd_bytes    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (instance, infohash)
+    infohash  TEXT    NOT NULL PRIMARY KEY,
+    tier      TEXT    NOT NULL CHECK (tier IN ('cold','hot')),
+    since_ts  INTEGER NOT NULL,
+    ssd_bytes INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -97,27 +97,34 @@ class StateStore:
         cur = self._conn.execute("DELETE FROM snapshots WHERE ts < ?", (before_ts,))
         return cur.rowcount or 0
 
-    def get_tier(self, *, instance: str, infohash: str) -> tuple[str, int] | None:
+    def get_tier(self, *, infohash: str) -> tuple[str, int] | None:
         row = self._conn.execute(
-            "SELECT tier, since_ts FROM tier WHERE instance = ? AND infohash = ?",
-            (instance, infohash),
+            "SELECT tier, since_ts FROM tier WHERE infohash = ?",
+            (infohash,),
         ).fetchone()
         return (row[0], row[1]) if row else None
 
     def set_tier(
-        self, *, instance: str, infohash: str, tier: str, since_ts: int, ssd_bytes: int = 0
+        self, *, infohash: str, tier: str, since_ts: int, ssd_bytes: int = 0
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO tier (instance, infohash, tier, since_ts, ssd_bytes)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(instance, infohash) DO UPDATE SET
+            INSERT INTO tier (infohash, tier, since_ts, ssd_bytes)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(infohash) DO UPDATE SET
                 tier=excluded.tier,
                 since_ts=excluded.since_ts,
                 ssd_bytes=excluded.ssd_bytes
             """,
-            (instance, infohash, tier, since_ts, ssd_bytes),
+            (infohash, tier, since_ts, ssd_bytes),
         )
+
+    def delete_tier(self, *, infohash: str) -> None:
+        self._conn.execute("DELETE FROM tier WHERE infohash = ?", (infohash,))
+
+    def hot_infohashes(self) -> list[str]:
+        cur = self._conn.execute("SELECT infohash FROM tier WHERE tier = 'hot'")
+        return [row[0] for row in cur.fetchall()]
 
     def hot_total_bytes(self) -> int:
         row = self._conn.execute(

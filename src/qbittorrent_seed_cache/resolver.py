@@ -23,20 +23,22 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from .mover import TorrentLayout
 from .paths import map_to_host
-from .qbit_client import TorrentInfo
+
+if TYPE_CHECKING:
+    from .qbit_client import TorrentInfo
 
 log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedTorrent:
-    """All the per-file layouts for one torrent, plus aggregate size."""
+    """All the per-file layouts for one torrent in one qB instance."""
 
     instance: str
     infohash: str
@@ -50,6 +52,53 @@ class ResolvedTorrent:
             _link_target_is(layout.link, layout.ssd_target.parent.parent)
             for layout in self.layouts
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalTorrent:
+    """The same infohash possibly seeded by multiple qB instances.
+
+    SSD storage is deduplicated by infohash: one copy under
+    `ssd_cache_dir/<infohash>/...`, shared by symlinks from every instance.
+    """
+
+    infohash: str
+    size_bytes: int
+    # All per-file layouts across every instance hosting this infohash.
+    # The `instance` field on each TorrentLayout identifies which qB it
+    # belongs to.
+    layouts: list[TorrentLayout]
+    # Instance names hosting this infohash, in stable order.
+    instances: tuple[str, ...]
+
+    @property
+    def is_hot_on_ssd(self) -> bool:
+        """True if every link across every instance resolves into the SSD cache."""
+        return all(
+            _link_target_is(layout.link, layout.ssd_target.parent.parent)
+            for layout in self.layouts
+        )
+
+
+def aggregate(per_instance: list[ResolvedTorrent]) -> dict[str, LogicalTorrent]:
+    """Group per-instance ResolvedTorrents by infohash into LogicalTorrents.
+
+    Size is taken from the first instance (same infohash → same size).
+    Layouts from every instance are concatenated.
+    """
+    grouped: dict[str, list[ResolvedTorrent]] = {}
+    for r in per_instance:
+        grouped.setdefault(r.infohash, []).append(r)
+
+    out: dict[str, LogicalTorrent] = {}
+    for infohash, parts in grouped.items():
+        layouts = [layout for r in parts for layout in r.layouts]
+        instances = tuple(sorted({r.instance for r in parts}))
+        size = parts[0].total_bytes
+        out[infohash] = LogicalTorrent(
+            infohash=infohash, size_bytes=size, layouts=layouts, instances=instances
+        )
+    return out
 
 
 def _link_target_is(link: Path, expected_root: Path) -> bool:
@@ -66,7 +115,7 @@ def _link_target_is(link: Path, expected_root: Path) -> bool:
 def resolve(
     *,
     instance: str,
-    torrent: TorrentInfo,
+    torrent: "TorrentInfo",
     files: list[dict[str, Any]],
     ssd_cache_dir: Path,
     path_map: dict[str, str],

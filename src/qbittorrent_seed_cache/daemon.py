@@ -1,18 +1,25 @@
-"""Main loop: poll → score → demote → promote.
+"""Main loop: poll → aggregate by infohash → score → demote → promote.
 
-A tick:
-  1. For each instance: log in to qB, fetch torrents+files, resolve their
-     host-side TorrentLayouts, record an upload snapshot in SQLite.
-  2. Score each resolved torrent against the rolling window.
-  3. Select demotions (hot → cold) and apply them — frees SSD bytes.
-  4. Recompute available headroom.
-  5. Select promotions (cold → hot) within headroom, apply sequentially
-     (bounded by max_concurrent_promotions, defending the HDD parallelism).
-  6. Update the tier table for every applied transition.
+Per-tick flow:
+  1. For each qB instance: log in, fetch torrents+files, resolve host paths,
+     persist a snapshot. Per-instance metrics are stored as-is.
+  2. Aggregate per-instance ResolvedTorrents into LogicalTorrents keyed by
+     infohash. The SSD copy is shared across instances; symlinks in each
+     instance are retargeted in lockstep.
+  3. Score hotness per (instance, infohash) and sum into a per-infohash
+     score. The `instances` list on each candidate is informational.
+  4. Bootstrap tier rows for previously-unknown infohashes from the
+     current symlink state (is_hot_on_ssd).
+  5. Cleanup orphans: infohashes with tier='hot' that no longer exist in
+     any instance (probably removed from qB) — rm their SSD dir, drop tier.
+  6. Apply demotions first (frees SSD bytes).
+  7. Recompute available headroom.
+  8. Apply promotions within headroom (greedy by hotness, capped by
+     max_concurrent_promotions).
 
-Crash recovery: tier records survive restarts. If a transition is
-interrupted mid-way, the on-disk symlink target is the authoritative
-state — the next tick re-derives the tier from the SSD usage and converges.
+Crash recovery: tier rows survive restarts. If a transition is interrupted
+mid-way, the on-disk symlinks + SSD content are authoritative; the next
+tick re-derives the tier from is_hot_on_ssd and converges.
 """
 
 from __future__ import annotations
@@ -25,20 +32,30 @@ import time
 import structlog
 
 from .config import Config, InstanceConfig
+from .hotness import HotnessScore
 from .hotness import score as score_history
-from .mover import TorrentLayout, demote, promote
-from .qbit_client import QbitClient, TorrentInfo
-from .resolver import ResolvedTorrent, resolve
+from .mover import demote, promote
+from .qbit_client import QbitClient
+from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, resolve
 from .selector import TorrentCandidate, select_demotions, select_promotions
 from .state import StateStore
+from .symlinks import remove_tree
 
 log = structlog.get_logger(__name__)
 
 
 async def _collect_instance(
     instance: InstanceConfig, config: Config
-) -> tuple[list[TorrentInfo], dict[str, ResolvedTorrent]]:
-    """Talk to one qB instance: return torrents + resolved layouts by infohash."""
+) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent]]:
+    """Poll one qB instance.
+
+    Returns:
+      - snapshots: list of (infohash, uploaded_session, upspeed) tuples to record.
+      - resolved: list of ResolvedTorrent for torrents that follow the symlink
+        convention.
+    """
+    snapshots: list[tuple[str, int, int]] = []
+    resolved_list: list[ResolvedTorrent] = []
     async with QbitClient(
         name=instance.name,
         url=instance.url,
@@ -46,8 +63,8 @@ async def _collect_instance(
         password=instance.password.get_secret_value(),
     ) as client:
         torrents = await client.torrents()
-        resolved: dict[str, ResolvedTorrent] = {}
         for t in torrents:
+            snapshots.append((t.hash, t.uploaded_session, t.upspeed))
             files = await client.torrent_files(t.hash)
             r = resolve(
                 instance=instance.name,
@@ -58,70 +75,106 @@ async def _collect_instance(
                 managed_paths=config.managed_paths,
             )
             if r is not None:
-                resolved[t.hash] = r
-        return torrents, resolved
+                resolved_list.append(r)
+    return snapshots, resolved_list
+
+
+def _aggregate_score(
+    instances: tuple[str, ...],
+    infohash: str,
+    store: StateStore,
+    *,
+    now_ts: int,
+    window_seconds: int,
+) -> HotnessScore:
+    """Sum per-instance hotness into a logical-torrent score."""
+    cutoff = now_ts - window_seconds
+    total_window = 0
+    total_per_day = 0.0
+    last_activity = 0
+    for name in instances:
+        history = store.history(instance=name, infohash=infohash, since_ts=cutoff)
+        s = score_history(history, window_seconds=window_seconds)
+        total_window += s.upload_bytes_in_window
+        total_per_day += s.upload_bytes_per_day
+        last_activity = max(last_activity, s.last_activity_ts)
+    return HotnessScore(
+        upload_bytes_in_window=total_window,
+        upload_bytes_per_day=total_per_day,
+        last_activity_ts=last_activity,
+    )
 
 
 def _build_candidates(
-    instance_name: str,
-    torrents: list[TorrentInfo],
-    resolved: dict[str, ResolvedTorrent],
+    logical: dict[str, LogicalTorrent],
     store: StateStore,
     *,
     now_ts: int,
     window_seconds: int,
 ) -> list[TorrentCandidate]:
-    candidates: list[TorrentCandidate] = []
-    cutoff = now_ts - window_seconds
-    for t in torrents:
-        r = resolved.get(t.hash)
-        if r is None:
-            continue
-        history = store.history(instance=instance_name, infohash=t.hash, since_ts=cutoff)
-        hs = score_history(history, window_seconds=window_seconds)
-        tier_row = store.get_tier(instance=instance_name, infohash=t.hash)
-        if tier_row is not None:
-            tier, since_ts = tier_row
+    out: list[TorrentCandidate] = []
+    for infohash, lt in logical.items():
+        score = _aggregate_score(
+            lt.instances, infohash, store,
+            now_ts=now_ts, window_seconds=window_seconds,
+        )
+        tier_row = store.get_tier(infohash=infohash)
+        if tier_row is None:
+            current_tier: str | None = None
+            since_ts = 0
         else:
-            tier, since_ts = None, 0
-        candidates.append(
+            current_tier, since_ts = tier_row
+        out.append(
             TorrentCandidate(
-                instance=instance_name,
-                infohash=t.hash,
-                size_bytes=r.total_bytes,
-                score=hs,
-                current_tier=tier,
+                infohash=infohash,
+                size_bytes=lt.size_bytes,
+                score=score,
+                current_tier=current_tier,
                 tier_since_ts=since_ts,
+                instances=lt.instances,
             )
         )
-    return candidates
+    return out
 
 
 def _bootstrap_tier(
     candidates: list[TorrentCandidate],
-    resolved: dict[str, ResolvedTorrent],
+    logical: dict[str, LogicalTorrent],
     store: StateStore,
     *,
     now_ts: int,
 ) -> None:
-    """For any candidate without a tier record, infer it from the symlink state."""
+    """Infer tier from current symlink state for any new infohash."""
     for c in candidates:
         if c.current_tier is not None:
             continue
-        r = resolved[c.infohash]
-        tier = "hot" if r.is_hot_on_ssd else "cold"
-        ssd_bytes = r.total_bytes if tier == "hot" else 0
+        lt = logical[c.infohash]
+        tier = "hot" if lt.is_hot_on_ssd else "cold"
+        ssd_bytes = lt.size_bytes if tier == "hot" else 0
         store.set_tier(
-            instance=c.instance,
-            infohash=c.infohash,
-            tier=tier,
-            since_ts=now_ts,
-            ssd_bytes=ssd_bytes,
+            infohash=c.infohash, tier=tier, since_ts=now_ts, ssd_bytes=ssd_bytes
         )
 
 
+def _cleanup_orphans(
+    live_infohashes: set[str], config: Config, store: StateStore
+) -> int:
+    """Drop SSD content + tier row for hot infohashes no longer in any qB instance."""
+    freed_count = 0
+    for ih in store.hot_infohashes():
+        if ih in live_infohashes:
+            continue
+        ssd_dir = config.ssd_cache_dir / ih
+        log.info("orphan.cleanup", infohash=ih, ssd_dir=str(ssd_dir), dry_run=config.dry_run)
+        if not config.dry_run:
+            remove_tree(ssd_dir)
+            store.delete_tier(infohash=ih)
+        freed_count += 1
+    return freed_count
+
+
 def _free_ssd_bytes(config: Config, store: StateStore) -> int:
-    """Available bytes for new promotions: min(quota_headroom, fs_free - min_free)."""
+    """Bytes still spendable for new promotions."""
     used = store.hot_total_bytes()
     quota_b = int(config.quota_gb * 1024**3)
     min_free_b = int(config.min_free_gb * 1024**3)
@@ -129,105 +182,87 @@ def _free_ssd_bytes(config: Config, store: StateStore) -> int:
     return max(0, min(quota_b - used, free - min_free_b))
 
 
-def _apply_demotion(
-    layouts: list[TorrentLayout], *, dry_run: bool
-) -> int:
-    freed = 0
-    for layout in layouts:
-        freed += demote(layout, dry_run=dry_run)
-    return freed
-
-
-def _apply_promotion(
-    layouts: list[TorrentLayout], *, dry_run: bool
-) -> int:
-    copied = 0
-    for layout in layouts:
-        copied += promote(layout, dry_run=dry_run)
-    return copied
-
-
 async def _tick(config: Config, store: StateStore) -> None:
     now = int(time.time())
+    window_seconds = config.hotness.window_days * 86_400
 
-    # 1. Poll every instance in parallel.
+    # 1. Poll instances in parallel.
     instance_results = await asyncio.gather(
         *(_collect_instance(i, config) for i in config.instances),
         return_exceptions=True,
     )
 
-    all_candidates: list[TorrentCandidate] = []
-    resolved_by_key: dict[tuple[str, str], ResolvedTorrent] = {}
-
-    window_seconds = config.hotness.window_days * 86_400
-
+    all_resolved: list[ResolvedTorrent] = []
     for instance, result in zip(config.instances, instance_results, strict=True):
         if isinstance(result, BaseException):
             log.error("instance.poll_failed", instance=instance.name, error=str(result))
             continue
-        torrents, resolved = result
-
-        for t in torrents:
+        snapshots, resolved_list = result
+        for infohash, uploaded, upspeed in snapshots:
             await asyncio.to_thread(
                 store.record,
                 instance=instance.name,
-                infohash=t.hash,
+                infohash=infohash,
                 ts=now,
-                uploaded_session=t.uploaded_session,
-                upspeed=t.upspeed,
+                uploaded_session=uploaded,
+                upspeed=upspeed,
             )
-
-        instance_candidates = _build_candidates(
-            instance.name, torrents, resolved, store,
-            now_ts=now, window_seconds=window_seconds,
-        )
-        _bootstrap_tier(instance_candidates, resolved, store, now_ts=now)
-
-        all_candidates.extend(instance_candidates)
-        for h, r in resolved.items():
-            resolved_by_key[(instance.name, h)] = r
-
+        all_resolved.extend(resolved_list)
         log.info(
             "tick.snapshot",
             instance=instance.name,
-            torrents=len(torrents),
-            resolved=len(resolved),
+            snapshots=len(snapshots),
+            resolved=len(resolved_list),
         )
 
-    # 2. Prune old snapshots.
+    # 2. Aggregate by infohash.
+    logical = aggregate(all_resolved)
+    log.info("tick.aggregate", logical_torrents=len(logical), per_instance=len(all_resolved))
+
+    # 3. Prune old snapshots.
     pruned = await asyncio.to_thread(store.prune, before_ts=now - window_seconds)
     if pruned:
         log.info("tick.pruned", rows=pruned)
 
-    # 3. Demote first (frees quota).
+    # 4. Build per-infohash candidates + bootstrap unknown tiers.
+    candidates = _build_candidates(
+        logical, store, now_ts=now, window_seconds=window_seconds
+    )
+    _bootstrap_tier(candidates, logical, store, now_ts=now)
+
+    # 5. Cleanup orphans (hot tier but no live torrent).
+    orphans_dropped = await asyncio.to_thread(
+        _cleanup_orphans, set(logical.keys()), config, store
+    )
+    if orphans_dropped:
+        log.info("tick.orphans_cleaned", count=orphans_dropped)
+
+    # 6. Demote first.
     demotions = select_demotions(
-        all_candidates,
+        candidates,
         now_ts=now,
         demote_max_mb=config.hotness.demote_max_upload_mb,
         min_hot_minutes=config.hotness.min_hot_minutes,
     )
     for c in demotions:
-        r = resolved_by_key[(c.instance, c.infohash)]
+        lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(_apply_demotion, r.layouts, dry_run=config.dry_run)
+            await asyncio.to_thread(demote, lt.layouts, dry_run=config.dry_run)
         except Exception:
-            log.exception("demote.failed", instance=c.instance, infohash=c.infohash)
+            log.exception("demote.failed", infohash=c.infohash)
             continue
         if not config.dry_run:
-            store.set_tier(
-                instance=c.instance, infohash=c.infohash,
-                tier="cold", since_ts=now, ssd_bytes=0,
-            )
+            store.set_tier(infohash=c.infohash, tier="cold", since_ts=now, ssd_bytes=0)
     if demotions:
         log.info("tick.demoted", count=len(demotions))
 
-    # 4. Recompute headroom.
+    # 7. Recompute headroom.
     available = await asyncio.to_thread(_free_ssd_bytes, config, store)
     log.info("tick.headroom_bytes", bytes=available)
 
-    # 5. Promote within headroom.
+    # 8. Promote within headroom.
     promotions = select_promotions(
-        all_candidates,
+        candidates,
         now_ts=now,
         promote_min_mb=config.hotness.promote_min_upload_mb,
         min_cold_minutes=config.hotness.min_cold_minutes,
@@ -235,16 +270,15 @@ async def _tick(config: Config, store: StateStore) -> None:
         max_concurrent=config.max_concurrent_promotions,
     )
     for c in promotions:
-        r = resolved_by_key[(c.instance, c.infohash)]
+        lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(_apply_promotion, r.layouts, dry_run=config.dry_run)
+            await asyncio.to_thread(promote, lt.layouts, dry_run=config.dry_run)
         except Exception:
-            log.exception("promote.failed", instance=c.instance, infohash=c.infohash)
+            log.exception("promote.failed", infohash=c.infohash)
             continue
         if not config.dry_run:
             store.set_tier(
-                instance=c.instance, infohash=c.infohash,
-                tier="hot", since_ts=now, ssd_bytes=c.size_bytes,
+                infohash=c.infohash, tier="hot", since_ts=now, ssd_bytes=c.size_bytes
             )
     if promotions:
         log.info("tick.promoted", count=len(promotions))
@@ -258,7 +292,6 @@ async def run_daemon(config: Config) -> None:
         dry_run=config.dry_run,
     )
 
-    # Ensure cache dir + marker file exist (mover is rw on the SSD).
     config.ssd_cache_dir.mkdir(parents=True, exist_ok=True)
     marker = config.ssd_cache_dir / ".ssd-mount-ok"
     if not marker.exists():
