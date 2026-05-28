@@ -1,0 +1,82 @@
+# qbittorrent-seed-cache — annotated reference config.
+#
+# All sizes are in MB unless explicitly suffixed (_gb). All durations are in
+# seconds unless explicitly suffixed (_min, _days).
+
+# --- SSD cache layout -----------------------------------------------------
+# Absolute path of the SSD directory used to host hot torrent copies. Must
+# be reachable at the *same path* on the host and in any container that
+# needs to resolve the absolute symlinks (qbittorrent, sonarr, radarr).
+ssd_cache_dir: /var/lib/seed-cache
+
+# Soft quota: when the SSD usage exceeds this, no new promotions happen
+# and the coldest hot torrents are demoted at the next tick.
+quota_gb: 100
+
+# Headroom kept free on the SSD filesystem regardless of quota_gb. Useful
+# when the SSD is shared with other workloads.
+min_free_gb: 10
+
+# --- Bulk filesystem ------------------------------------------------------
+# Root of the bulk filesystem where the canonical files live. Used only
+# for sanity checks (we never move files in here).
+bulk_root: /mnt/media
+
+# Paths inside `bulk_root` that, when present under torrents/, identify
+# entries the mover may touch. The mover ignores torrents whose content
+# does not resolve into one of these subtrees.
+managed_paths:
+  - /mnt/media/storage
+
+# --- qBittorrent instances ------------------------------------------------
+# One block per qB instance. Multiple instances are polled in parallel and
+# share the same SSD quota. Names must be unique.
+instances:
+  - name: qbittorrent
+    url: http://qbittorrent:8080
+    username: admin
+    password: CHANGE_ME
+
+  # Uncomment for a second instance (e.g. a standalone qB next to a
+  # VPN-routed one):
+  # - name: qbittorrentaf
+  #   url: http://qbittorrentaf:8181
+  #   username: admin
+  #   password: CHANGE_ME
+
+# --- Hotness scoring ------------------------------------------------------
+hotness:
+  # Rolling window used to compute upload activity.
+  window_days: 14
+
+  # Promote when EMA(upload bytes / window) crosses this threshold.
+  promote_min_upload_mb: 50
+
+  # Demote when EMA drops below this threshold (asymmetric to avoid flapping).
+  demote_max_upload_mb: 5
+
+  # Minimum time a torrent stays in its current tier before being eligible
+  # for the opposite transition. Prevents rapid flapping at the boundary.
+  min_hot_minutes: 60
+  min_cold_minutes: 120
+
+# --- Daemon loop ----------------------------------------------------------
+# How often to poll qB and evaluate promotions/demotions.
+poll_interval_sec: 300
+
+# Where to store the rolling-window SQLite DB. Persists across restarts.
+state_db: /var/lib/seed-cache/state.db
+
+# Logging: "json" for structlog JSON (good for container logs) or "console"
+# for human-friendly output during development.
+log_format: json
+log_level: INFO
+
+# --- Safety knobs ---------------------------------------------------------
+# Dry-run: log every intended transition but do not actually copy/symlink.
+# Useful for the first runs.
+dry_run: false
+
+# Maximum number of concurrent promotions in one tick. Each promotion is
+# a sequential HDD read, so this is effectively the HDD parallelism.
+max_concurrent_promotions: 1

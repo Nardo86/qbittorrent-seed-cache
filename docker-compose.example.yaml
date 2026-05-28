@@ -1,0 +1,75 @@
+# Example layout: a qBittorrent + Sonarr + Radarr + seed-cache mover sharing
+# the same SSD path on host and in every container.
+#
+# Key invariant: /var/lib/seed-cache is bind-mounted at the *same absolute
+# path* on host and in qbittorrent / sonarr / radarr. The mover writes
+# absolute symlinks pointing into it, so the path must resolve identically
+# everywhere.
+
+services:
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+      - WEBUI_PORT=8080
+    volumes:
+      - ./qbittorrent/config:/config
+      - /mnt/media/storage:/data
+      - /var/lib/seed-cache:/var/lib/seed-cache    # same path host↔container
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /data/.nfs-mount-ok && test -e /var/lib/seed-cache/.ssd-mount-ok || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+    volumes:
+      - ./sonarr/config:/config
+      - /mnt/media/storage:/data
+      - /var/lib/seed-cache:/var/lib/seed-cache:ro
+      - ./tools:/opt/seed-cache-tools:ro            # exposes post-import.sh
+    ports:
+      - "8989:8989"
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+    volumes:
+      - ./radarr/config:/config
+      - /mnt/media/storage:/data
+      - /var/lib/seed-cache:/var/lib/seed-cache:ro
+      - ./tools:/opt/seed-cache-tools:ro
+    ports:
+      - "7878:7878"
+    restart: unless-stopped
+
+  seed-cache:
+    image: ghcr.io/erosnardi/qbittorrent-seed-cache:latest
+    container_name: seed-cache
+    depends_on:
+      - qbittorrent
+    environment:
+      - QBSC_CONFIG=/etc/qbittorrent-seed-cache/config.yaml
+    volumes:
+      - /var/lib/seed-cache:/var/lib/seed-cache
+      - /mnt/media:/mnt/media:ro
+      - ./config.yaml:/etc/qbittorrent-seed-cache/config.yaml:ro
+    restart: unless-stopped
