@@ -9,6 +9,7 @@ new value as the delta from zero.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 
 from .state import Snapshot
 
@@ -33,7 +34,7 @@ def score(snapshots: list[Snapshot], window_seconds: int) -> HotnessScore:
 
     total = 0
     last_activity = snapshots[0].ts
-    for prev, cur in zip(snapshots, snapshots[1:], strict=False):
+    for prev, cur in pairwise(snapshots):
         delta = cur.uploaded_session - prev.uploaded_session
         if delta < 0:
             # qB restart: prev counter discarded, current value is the delta

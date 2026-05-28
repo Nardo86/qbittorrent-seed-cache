@@ -115,7 +115,7 @@ def _link_target_is(link: Path, expected_root: Path) -> bool:
 def resolve(
     *,
     instance: str,
-    torrent: "TorrentInfo",
+    torrent: TorrentInfo,
     files: list[dict[str, Any]],
     ssd_cache_dir: Path,
     path_map: dict[str, str],

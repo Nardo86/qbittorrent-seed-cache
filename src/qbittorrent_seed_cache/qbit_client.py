@@ -26,7 +26,7 @@ class TorrentInfo:
     state: str
 
     @classmethod
-    def from_api(cls, d: dict[str, Any]) -> "TorrentInfo":
+    def from_api(cls, d: dict[str, Any]) -> TorrentInfo:
         return cls(
             hash=d["hash"],
             name=d["name"],
@@ -50,7 +50,7 @@ class QbitClient:
         self._password = password
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> "QbitClient":
+    async def __aenter__(self) -> QbitClient:
         self._client = httpx.AsyncClient(base_url=self._url, timeout=30.0)
         await self._login()
         return self

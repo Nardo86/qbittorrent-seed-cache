@@ -32,14 +32,15 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
     "mypy>=1.10",
+    "types-PyYAML",
 ]
 
 [project.scripts]
 qbittorrent-seed-cache = "qbittorrent_seed_cache.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/erosnardi/qbittorrent-seed-cache"
-Issues = "https://github.com/erosnardi/qbittorrent-seed-cache/issues"
+Homepage = "https://github.com/Nardo86/qbittorrent-seed-cache"
+Issues = "https://github.com/Nardo86/qbittorrent-seed-cache/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qbittorrent_seed_cache"]
@@ -56,6 +57,7 @@ ignore = ["E501"]
 python_version = "3.12"
 strict = true
 warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

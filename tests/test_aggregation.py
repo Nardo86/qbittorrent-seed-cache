@@ -9,7 +9,6 @@ import pytest
 
 from qbittorrent_seed_cache.mover import TorrentLayout, demote, promote
 from qbittorrent_seed_cache.resolver import (
-    LogicalTorrent,
     ResolvedTorrent,
     aggregate,
 )

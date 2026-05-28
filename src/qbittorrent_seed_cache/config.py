@@ -7,6 +7,7 @@ from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic_core.core_schema import ValidationInfo
 
 
 class InstanceConfig(BaseModel):
@@ -29,7 +30,7 @@ class HotnessConfig(BaseModel):
 
     @field_validator("demote_max_upload_mb")
     @classmethod
-    def _check_thresholds(cls, v: float, info) -> float:
+    def _check_thresholds(cls, v: float, info: ValidationInfo) -> float:
         promote = info.data.get("promote_min_upload_mb")
         if promote is not None and v >= promote:
             raise ValueError("demote_max_upload_mb must be < promote_min_upload_mb (asymmetric)")
@@ -51,7 +52,7 @@ class Config(BaseModel):
 
     instances: list[InstanceConfig]
 
-    hotness: HotnessConfig = HotnessConfig()
+    hotness: HotnessConfig = Field(default_factory=lambda: HotnessConfig())
 
     poll_interval_sec: int = Field(300, gt=0)
     state_db: Path = Path("/var/lib/seed-cache/state.db")

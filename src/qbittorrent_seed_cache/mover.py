@@ -21,9 +21,9 @@ Both helpers expect every layout in the list to share the same infohash.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import structlog
 

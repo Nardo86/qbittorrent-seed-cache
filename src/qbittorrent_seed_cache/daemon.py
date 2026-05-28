@@ -29,6 +29,7 @@ tick re-derives the tier from is_hot_on_ssd and converges.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import signal
 import time
@@ -349,10 +350,8 @@ async def run_daemon(config: Config) -> None:
             except Exception:
                 log.exception("tick.failed")
 
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=config.poll_interval_sec)
-            except asyncio.TimeoutError:
-                pass
     finally:
         store.close()
         log.info("daemon.stop")

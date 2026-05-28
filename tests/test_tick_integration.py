@@ -20,7 +20,6 @@ from qbittorrent_seed_cache.daemon import _tick
 from qbittorrent_seed_cache.qbit_client import TorrentInfo
 from qbittorrent_seed_cache.state import StateStore
 
-
 # --- fake qB client --------------------------------------------------------
 
 
@@ -43,7 +42,7 @@ def make_fake_client(data: dict[str, dict[str, Any]]) -> type:
             self.name = name
             self._d = data[name]
 
-        async def __aenter__(self) -> "_Fake":
+        async def __aenter__(self) -> _Fake:
             return self
 
         async def __aexit__(self, *exc: object) -> None:
