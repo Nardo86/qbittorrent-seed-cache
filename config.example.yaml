@@ -17,6 +17,12 @@ quota_gb: 100
 # when the SSD is shared with other workloads.
 min_free_gb: 10
 
+# Per-torrent size cap. Torrents larger than this are never promoted, even
+# if they're the hottest candidate — useful to keep huge multi-file torrents
+# (whole TV seasons, filmographies) off the SSD when they would otherwise
+# dominate the quota. Omit or set to null for no cap.
+# max_torrent_size_gb: 50
+
 # --- Bulk filesystem ------------------------------------------------------
 # Root of the bulk filesystem where the canonical files live. Used only
 # for sanity checks (we never move files in here).

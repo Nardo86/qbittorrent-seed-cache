@@ -73,6 +73,7 @@ def select_promotions(
     min_cold_minutes: int,
     available_bytes: int,
     max_concurrent: int,
+    max_size_bytes: int | None = None,
 ) -> list[TorrentCandidate]:
     """Return cold torrents to promote, hottest first, subject to quota.
 
@@ -80,6 +81,7 @@ def select_promotions(
     - It is currently cold (or never tracked).
     - It has been cold for at least `min_cold_minutes` (skipped if never tracked).
     - Its upload rate is above `promote_min_mb` per day.
+    - Its size is at or below `max_size_bytes` (if set).
 
     We pick greedily by hotness DESC, fitting up to `available_bytes` and at
     most `max_concurrent` torrents per tick (to bound HDD parallelism).
@@ -93,7 +95,16 @@ def select_promotions(
             return False
         return (now_ts - c.tier_since_ts) >= min_age_sec
 
-    eligible = [c for c in candidates if cold_enough(c) and _per_day_mb(c.score) >= promote_min_mb]
+    def under_size_cap(c: TorrentCandidate) -> bool:
+        return max_size_bytes is None or c.size_bytes <= max_size_bytes
+
+    eligible = [
+        c
+        for c in candidates
+        if cold_enough(c)
+        and under_size_cap(c)
+        and _per_day_mb(c.score) >= promote_min_mb
+    ]
     eligible.sort(key=lambda c: _per_day_mb(c.score), reverse=True)
 
     picked: list[TorrentCandidate] = []

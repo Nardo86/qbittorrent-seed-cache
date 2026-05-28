@@ -40,6 +40,11 @@ class Config(BaseModel):
     ssd_cache_dir: Path
     quota_gb: float = Field(100, gt=0)
     min_free_gb: float = Field(10, ge=0)
+    # Per-torrent size cap. Torrents above this size are never promoted, even
+    # if they're the hottest candidate. Useful for huge multi-file torrents
+    # (whole TV series, filmographies) that would dominate the SSD quota.
+    # None = no cap.
+    max_torrent_size_gb: float | None = Field(None, gt=0)
 
     bulk_root: Path
     managed_paths: list[Path]

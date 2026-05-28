@@ -286,6 +286,11 @@ async def _tick(config: Config, store: StateStore) -> None:
     log.info("tick.headroom_bytes", bytes=available)
 
     # 9. Promote within headroom.
+    max_size_bytes = (
+        int(config.max_torrent_size_gb * 1024**3)
+        if config.max_torrent_size_gb is not None
+        else None
+    )
     promotions = select_promotions(
         candidates,
         now_ts=now,
@@ -293,6 +298,7 @@ async def _tick(config: Config, store: StateStore) -> None:
         min_cold_minutes=config.hotness.min_cold_minutes,
         available_bytes=available,
         max_concurrent=config.max_concurrent_promotions,
+        max_size_bytes=max_size_bytes,
     )
     for c in promotions:
         lt = logical[c.infohash]

@@ -118,6 +118,40 @@ def test_demote_requires_min_hot_minutes() -> None:
     assert picked == []
 
 
+def test_promote_excludes_oversized_torrents() -> None:
+    cands = [
+        _cand("huge", size_gb=300, per_day_mb=500, tier="cold", age_sec=99999),
+        _cand("ok", size_gb=20, per_day_mb=100, tier="cold", age_sec=99999),
+    ]
+    picked = select_promotions(
+        cands,
+        now_ts=10_000,
+        promote_min_mb=50,
+        min_cold_minutes=0,
+        available_bytes=500 * GB,
+        max_concurrent=10,
+        max_size_bytes=int(50 * GB),
+    )
+    # 'huge' is excluded by the size cap even though it's hotter and would fit.
+    assert [c.infohash for c in picked] == ["ok"]
+
+
+def test_promote_no_cap_when_max_size_none() -> None:
+    cands = [
+        _cand("huge", size_gb=300, per_day_mb=500, tier="cold", age_sec=99999),
+    ]
+    picked = select_promotions(
+        cands,
+        now_ts=10_000,
+        promote_min_mb=50,
+        min_cold_minutes=0,
+        available_bytes=500 * GB,
+        max_concurrent=10,
+        max_size_bytes=None,
+    )
+    assert [c.infohash for c in picked] == ["huge"]
+
+
 def test_demote_ignores_cold() -> None:
     c = _cand("cold", per_day_mb=1, tier="cold", age_sec=99999)
     picked = select_demotions(
