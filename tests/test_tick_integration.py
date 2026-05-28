@@ -188,7 +188,11 @@ async def test_baseline_tick_bootstraps_cold(
         await _tick(config, store)
 
         # Torrent bootstrapped as cold; SSD untouched; symlink still relative.
-        assert store.get_tier(infohash="HASHA") == ("cold", pytest.approx(int(time.time()), abs=5))
+        tier = store.get_tier(infohash="HASHA")
+        assert tier is not None
+        assert tier.tier == "cold"
+        assert tier.since_ts == pytest.approx(int(time.time()), abs=5)
+        assert tier.bulk_targets is None
         assert not (ssd / "HASHA").exists()
         link = save_qb / "movie.mkv"
         assert link.is_symlink()
@@ -246,7 +250,11 @@ async def test_tick_promotes_hot_torrent(
         # Tier flipped to hot; SSD copy made; symlink absolute → SSD.
         tier = store.get_tier(infohash="HASHHOT")
         assert tier is not None
-        assert tier[0] == "hot"
+        assert tier.tier == "hot"
+        # bulk_targets persisted so the next tick can resolve the symlink
+        # that now points into the SSD.
+        assert tier.bulk_targets is not None
+        assert len(tier.bulk_targets) == 1
 
         ssd_file = ssd / "HASHHOT" / "video.mkv"
         assert ssd_file.is_file()
@@ -354,7 +362,10 @@ async def test_tick_multi_instance_dedup_quota(
 
         # Tier hot; quota counted once.
         tier = store.get_tier(infohash="HASHSHARED")
-        assert tier is not None and tier[0] == "hot"
+        assert tier is not None and tier.tier == "hot"
+        # Both instances' links recorded in bulk_targets.
+        assert tier.bulk_targets is not None
+        assert len(tier.bulk_targets) == 2
         # ssd_bytes should equal one copy, not two.
         assert store.hot_total_bytes() == ti_a.size
 
@@ -365,5 +376,68 @@ async def test_tick_multi_instance_dedup_quota(
         for link in (save_a / "media.mkv", save_b / "media.mkv"):
             assert link.is_symlink()
             assert Path(os.readlink(link)) == ssd_file
+    finally:
+        store.close()
+
+
+async def test_hot_torrent_survives_subsequent_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the orphan-cleanup bug: after a torrent is promoted, its
+    symlink resolves into the SSD (not the bulk fs). The next tick's
+    resolver MUST still recognise the torrent as live, otherwise the
+    orphan-cleanup pass deletes its SSD content. We persist bulk_targets at
+    promote time and feed them back to resolve()."""
+    bulk_root, ssd = make_dirs(tmp_path)
+
+    save_qb = bulk_root / "storage" / "torrents" / "rel-Hot"
+    ti, files = make_torrent(
+        bulk_root=bulk_root,
+        save_subdir_host=save_qb,
+        save_path_qb="/data/torrents/rel-Hot",
+        rel_files=[("video.mkv", b"x" * 200)],
+        infohash="HASHSURVIVE",
+        uploaded_session=400 * 1024 * 1024,
+    )
+
+    data = {"qb1": {"torrents": [ti], "files": {"HASHSURVIVE": files}}}
+    monkeypatch.setattr(
+        "qbittorrent_seed_cache.daemon.QbitClient", make_fake_client(data)
+    )
+    config = make_config(
+        tmp_path, bulk_root=bulk_root, ssd=ssd, instance_names=["qb1"],
+        promote_min_mb=50,
+    )
+
+    store = StateStore(config.state_db)
+    try:
+        day_ago = int(time.time()) - 86_400
+        store.record(instance="qb1", infohash="HASHSURVIVE", ts=day_ago,
+                     uploaded_session=0, upspeed=0)
+        store.set_tier(infohash="HASHSURVIVE", tier="cold",
+                       since_ts=day_ago, ssd_bytes=0)
+
+        # Tick 1: should promote.
+        await _tick(config, store)
+
+        ssd_file = ssd / "HASHSURVIVE" / "video.mkv"
+        assert ssd_file.is_file(), "SSD copy missing after tick 1"
+        tier_after_1 = store.get_tier(infohash="HASHSURVIVE")
+        assert tier_after_1 is not None and tier_after_1.tier == "hot"
+
+        link = save_qb / "video.mkv"
+        assert Path(os.readlink(link)) == ssd_file
+
+        # Tick 2: with the same qB input, the torrent is still live. The
+        # symlink resolves into the SSD now, so the resolver needs
+        # bulk_targets from the tier to keep classifying it as live.
+        await _tick(config, store)
+
+        # SSD content + tier survived.
+        assert ssd_file.is_file(), "SSD copy was orphan-cleaned!"
+        tier_after_2 = store.get_tier(infohash="HASHSURVIVE")
+        assert tier_after_2 is not None and tier_after_2.tier == "hot"
+        # Symlink still pointing at the SSD.
+        assert Path(os.readlink(link)) == ssd_file
     finally:
         store.close()

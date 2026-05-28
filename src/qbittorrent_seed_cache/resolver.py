@@ -120,6 +120,7 @@ def resolve(
     ssd_cache_dir: Path,
     path_map: dict[str, str],
     managed_paths: list[Path],
+    hot_bulk_map: dict[str, str] | None = None,
 ) -> ResolvedTorrent | None:
     """Resolve a torrent to its per-file layouts, or None to skip.
 
@@ -127,6 +128,14 @@ def resolve(
     `.nfo` left as a real file by the migration), or is missing, or resolves
     outside `managed_paths`, that file is omitted. The torrent as a whole is
     only skipped when *no* file remains.
+
+    `hot_bulk_map`: for a torrent that's already promoted, the link points
+    *into* `ssd_cache_dir`, so `readlink` can't tell us where the bulk file
+    lives. The daemon precomputes a `{link_host_path: bulk_host_path}` map
+    from the persisted tier rows and passes it here; when we see a link
+    that resolves into the SSD, we look the bulk up in this map. If the
+    link is missing from the map, we treat the file as corrupted state
+    (skip + log) — better than misclassifying the torrent as orphan.
 
     Rationale: real torrents often bundle small extras (.nfo, .txt, covers)
     next to the main media file. Forcing the entire torrent to be all-or-
@@ -163,7 +172,25 @@ def resolve(
             skipped += 1
             continue
 
-        bulk_target = Path(os.path.realpath(link))
+        link_target = Path(os.path.realpath(link))
+
+        # If the symlink resolves into the SSD cache, this is an already-hot
+        # torrent. Look up the canonical bulk_target from the precomputed map.
+        if _is_under(link_target, ssd_cache_dir):
+            bulk_target_str = (hot_bulk_map or {}).get(str(link))
+            if bulk_target_str is None:
+                log.warning(
+                    "resolve.skip_file_hot_unknown_bulk",
+                    instance=instance,
+                    infohash=torrent.hash,
+                    link=str(link),
+                    ssd_target=str(link_target),
+                )
+                skipped += 1
+                continue
+            bulk_target = Path(bulk_target_str)
+        else:
+            bulk_target = link_target
 
         if managed_paths and not any(_is_under(bulk_target, mp) for mp in managed_paths):
             log.debug(

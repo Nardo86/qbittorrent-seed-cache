@@ -1,21 +1,25 @@
 """Main loop: poll → aggregate by infohash → score → demote → promote.
 
 Per-tick flow:
-  1. For each qB instance: log in, fetch torrents+files, resolve host paths,
+  1. Load persisted `bulk_targets` for every hot torrent (so the resolver
+     can recover the bulk path of a torrent whose symlink now points
+     into the SSD cache).
+  2. For each qB instance: log in, fetch torrents+files, resolve host paths,
      persist a snapshot. Per-instance metrics are stored as-is.
-  2. Aggregate per-instance ResolvedTorrents into LogicalTorrents keyed by
+  3. Aggregate per-instance ResolvedTorrents into LogicalTorrents keyed by
      infohash. The SSD copy is shared across instances; symlinks in each
      instance are retargeted in lockstep.
-  3. Score hotness per (instance, infohash) and sum into a per-infohash
+  4. Score hotness per (instance, infohash) and sum into a per-infohash
      score. The `instances` list on each candidate is informational.
-  4. Bootstrap tier rows for previously-unknown infohashes from the
+  5. Bootstrap tier rows for previously-unknown infohashes from the
      current symlink state (is_hot_on_ssd).
-  5. Cleanup orphans: infohashes with tier='hot' that no longer exist in
+  6. Cleanup orphans: infohashes with tier='hot' that no longer exist in
      any instance (probably removed from qB) — rm their SSD dir, drop tier.
-  6. Apply demotions first (frees SSD bytes).
-  7. Recompute available headroom.
-  8. Apply promotions within headroom (greedy by hotness, capped by
-     max_concurrent_promotions).
+  7. Apply demotions first (frees SSD bytes).
+  8. Recompute available headroom.
+  9. Apply promotions within headroom (greedy by hotness, capped by
+     max_concurrent_promotions). On success, persist the bulk_targets
+     map alongside the tier row.
 
 Crash recovery: tier rows survive restarts. If a transition is interrupted
 mid-way, the on-disk symlinks + SSD content are authoritative; the next
@@ -45,7 +49,9 @@ log = structlog.get_logger(__name__)
 
 
 async def _collect_instance(
-    instance: InstanceConfig, config: Config
+    instance: InstanceConfig,
+    config: Config,
+    hot_bulk_maps: dict[str, dict[str, str]],
 ) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent]]:
     """Poll one qB instance.
 
@@ -53,6 +59,10 @@ async def _collect_instance(
       - snapshots: list of (infohash, uploaded_session, upspeed) tuples to record.
       - resolved: list of ResolvedTorrent for torrents that follow the symlink
         convention.
+
+    `hot_bulk_maps[infohash]` is the persisted {link_path: bulk_path} map for
+    torrents already promoted to SSD; passed through to resolve() so that the
+    bulk file can be recovered even when readlink() now points into the SSD.
     """
     snapshots: list[tuple[str, int, int]] = []
     resolved_list: list[ResolvedTorrent] = []
@@ -73,6 +83,7 @@ async def _collect_instance(
                 ssd_cache_dir=config.ssd_cache_dir,
                 path_map=instance.path_map,
                 managed_paths=config.managed_paths,
+                hot_bulk_map=hot_bulk_maps.get(t.hash),
             )
             if r is not None:
                 resolved_list.append(r)
@@ -123,7 +134,8 @@ def _build_candidates(
             current_tier: str | None = None
             since_ts = 0
         else:
-            current_tier, since_ts = tier_row
+            current_tier = tier_row.tier
+            since_ts = tier_row.since_ts
         out.append(
             TorrentCandidate(
                 infohash=infohash,
@@ -151,8 +163,17 @@ def _bootstrap_tier(
         lt = logical[c.infohash]
         tier = "hot" if lt.is_hot_on_ssd else "cold"
         ssd_bytes = lt.size_bytes if tier == "hot" else 0
+        bulk_targets = (
+            {str(layout.link): str(layout.bulk_target) for layout in lt.layouts}
+            if tier == "hot"
+            else None
+        )
         store.set_tier(
-            infohash=c.infohash, tier=tier, since_ts=now_ts, ssd_bytes=ssd_bytes
+            infohash=c.infohash,
+            tier=tier,
+            since_ts=now_ts,
+            ssd_bytes=ssd_bytes,
+            bulk_targets=bulk_targets,
         )
 
 
@@ -186,9 +207,13 @@ async def _tick(config: Config, store: StateStore) -> None:
     now = int(time.time())
     window_seconds = config.hotness.window_days * 86_400
 
-    # 1. Poll instances in parallel.
+    # 1. Pre-load bulk_targets for every already-hot torrent so the resolver
+    #    can recover bulk paths even when readlink() now points into the SSD.
+    hot_bulk_maps = await asyncio.to_thread(store.hot_bulk_maps)
+
+    # 2. Poll instances in parallel.
     instance_results = await asyncio.gather(
-        *(_collect_instance(i, config) for i in config.instances),
+        *(_collect_instance(i, config, hot_bulk_maps) for i in config.instances),
         return_exceptions=True,
     )
 
@@ -215,29 +240,29 @@ async def _tick(config: Config, store: StateStore) -> None:
             resolved=len(resolved_list),
         )
 
-    # 2. Aggregate by infohash.
+    # 3. Aggregate by infohash.
     logical = aggregate(all_resolved)
     log.info("tick.aggregate", logical_torrents=len(logical), per_instance=len(all_resolved))
 
-    # 3. Prune old snapshots.
+    # 4. Prune old snapshots.
     pruned = await asyncio.to_thread(store.prune, before_ts=now - window_seconds)
     if pruned:
         log.info("tick.pruned", rows=pruned)
 
-    # 4. Build per-infohash candidates + bootstrap unknown tiers.
+    # 5. Build per-infohash candidates + bootstrap unknown tiers.
     candidates = _build_candidates(
         logical, store, now_ts=now, window_seconds=window_seconds
     )
     _bootstrap_tier(candidates, logical, store, now_ts=now)
 
-    # 5. Cleanup orphans (hot tier but no live torrent).
+    # 6. Cleanup orphans (hot tier but no live torrent).
     orphans_dropped = await asyncio.to_thread(
         _cleanup_orphans, set(logical.keys()), config, store
     )
     if orphans_dropped:
         log.info("tick.orphans_cleaned", count=orphans_dropped)
 
-    # 6. Demote first.
+    # 7. Demote first.
     demotions = select_demotions(
         candidates,
         now_ts=now,
@@ -256,11 +281,11 @@ async def _tick(config: Config, store: StateStore) -> None:
     if demotions:
         log.info("tick.demoted", count=len(demotions))
 
-    # 7. Recompute headroom.
+    # 8. Recompute headroom.
     available = await asyncio.to_thread(_free_ssd_bytes, config, store)
     log.info("tick.headroom_bytes", bytes=available)
 
-    # 8. Promote within headroom.
+    # 9. Promote within headroom.
     promotions = select_promotions(
         candidates,
         now_ts=now,
@@ -277,8 +302,15 @@ async def _tick(config: Config, store: StateStore) -> None:
             log.exception("promote.failed", infohash=c.infohash)
             continue
         if not config.dry_run:
+            bulk_targets = {
+                str(layout.link): str(layout.bulk_target) for layout in lt.layouts
+            }
             store.set_tier(
-                infohash=c.infohash, tier="hot", since_ts=now, ssd_bytes=c.size_bytes
+                infohash=c.infohash,
+                tier="hot",
+                since_ts=now,
+                ssd_bytes=c.size_bytes,
+                bulk_targets=bulk_targets,
             )
     if promotions:
         log.info("tick.promoted", count=len(promotions))
