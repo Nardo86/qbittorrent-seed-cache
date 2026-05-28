@@ -2,7 +2,9 @@
 
 Hot/cold tiering daemon for qBittorrent seeds: keep an SSD copy of the most actively-uploading torrents while the canonical files live on slow bulk storage (HDD / NAS / NFS). Aimed at home servers where a NAS HDD is kept spinning 24/7 by a long tail of low-rate seeds.
 
-> **Status:** scaffold. The promotion/demotion logic and hotness scoring are in active development.
+> **Status:** community-maintained, no active testing. In production on the
+> author's home server (two qBittorrent instances, ~300 torrents, NFS bulk over
+> a Synology DS214play). Issues and PRs welcome.
 
 ## What it does
 
@@ -50,11 +52,18 @@ See [docs/architecture.md](docs/architecture.md) for the full design (atomic tra
 
 ```bash
 docker run -d --name seed-cache \
+  --network host \
   -v /var/lib/seed-cache:/var/lib/seed-cache \
-  -v /mnt/media:/mnt/media \
+  -v /mnt/media:/mnt/media:ro \
   -v /path/to/config.yaml:/etc/qbittorrent-seed-cache/config.yaml:ro \
-  ghcr.io/<your-user>/qbittorrent-seed-cache:latest
+  nardo86/qbittorrent-seed-cache:latest
 ```
+
+Host networking is the simplest way to let the daemon reach qBittorrent's
+Web API on the host (e.g. `http://localhost:8080`) while still seeing the
+SSD bind mount at the same absolute path as qBittorrent itself.
+
+Multi-arch image: `linux/amd64`, `linux/arm64`.
 
 Full example with bind-mount layout for qB / Sonarr / Radarr: [`docker-compose.example.yaml`](docker-compose.example.yaml).
 
@@ -92,14 +101,23 @@ The [`tools/`](tools/) directory bundles one-shot helpers for the surrounding se
 
 | Component | State |
 |---|---|
-| Setup helpers (`tools/`)        | ✅ used in production on the author's setup |
-| qB Web API client               | 🚧 scaffold |
-| Hotness rolling window          | 🚧 scaffold |
-| Atomic promote/demote           | 🚧 scaffold |
-| Quota & candidate selection     | 🚧 scaffold |
-| Daemon loop                     | 🚧 scaffold |
-| Tests                           | 🚧 smoke only |
-| CI / image publishing           | 🚧 workflow drafted |
+| Setup helpers (`tools/`)        | ✅ used in production |
+| qB Web API client               | ✅ qB v4 & v5 (cookie auth) |
+| Hotness rolling window          | ✅ EMA with reset detection |
+| Atomic promote/demote           | ✅ tested against live qB |
+| Quota & candidate selection     | ✅ per-infohash, multi-instance dedup |
+| Daemon loop                     | ✅ demote → headroom → promote |
+| Tests                           | ✅ 38 pytest, incl. integration |
+| CI / image publishing           | ✅ multi-arch (amd64, arm64) |
+
+## Notes
+
+- **Built with help from Claude (Anthropic).** Review the configuration before production use. No warranty.
+- Image: <https://hub.docker.com/r/nardo86/qbittorrent-seed-cache>
+
+## Support
+
+⭐ Star • 🐛 Issue • 🔧 PR • ☕ <https://paypal.me/ErosNardi>
 
 ## License
 

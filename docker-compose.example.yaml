@@ -62,10 +62,14 @@ services:
     restart: unless-stopped
 
   seed-cache:
-    image: ghcr.io/erosnardi/qbittorrent-seed-cache:latest
+    image: nardo86/qbittorrent-seed-cache:latest
     container_name: seed-cache
     depends_on:
       - qbittorrent
+    # Host networking so the daemon can reach qB's Web API on the host
+    # (http://localhost:8080) and see the SSD bind mount at the same
+    # absolute path as qBittorrent.
+    network_mode: host
     environment:
       - QBSC_CONFIG=/etc/qbittorrent-seed-cache/config.yaml
     volumes:
