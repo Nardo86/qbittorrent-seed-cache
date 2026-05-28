@@ -61,16 +61,29 @@ class QbitClient:
             self._client = None
 
     async def _login(self) -> None:
+        """Authenticate against qB Web API v2.
+
+        qBittorrent's response shape depends on version:
+          - v4.x: 200 OK with body "Ok." on success, "Fails." on bad creds.
+          - v5.x: 204 No Content on success (no body).
+        In both cases a successful login sets a session cookie (QBT_SID_*).
+        We treat the cookie's presence as the source of truth and use the
+        status/body only for diagnostics.
+        """
         assert self._client is not None
         r = await self._client.post(
             "/api/v2/auth/login",
             data={"username": self._username, "password": self._password},
             headers={"Referer": self._url},
         )
-        r.raise_for_status()
-        if r.text.strip() != "Ok.":
-            raise RuntimeError(f"qB login failed for instance {self.name!r}")
-        log.info("qbit.login.ok", instance=self.name)
+        if any(name.startswith("QBT_SID") for name in r.cookies):
+            log.info("qbit.login.ok", instance=self.name, status=r.status_code)
+            return
+        body = r.text.strip()[:120]
+        raise RuntimeError(
+            f"qB login failed for instance {self.name!r}: "
+            f"HTTP {r.status_code} body={body!r} (no session cookie returned)"
+        )
 
     async def torrents(self) -> list[TorrentInfo]:
         assert self._client is not None

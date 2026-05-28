@@ -54,7 +54,12 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        # check_same_thread=False: the daemon serializes SQLite access at the
+        # event loop level but dispatches some queries through asyncio.to_thread,
+        # so the underlying connection is touched from the executor thread pool.
+        self._conn = sqlite3.connect(
+            self._path, isolation_level=None, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
 

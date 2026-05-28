@@ -121,11 +121,23 @@ def resolve(
     path_map: dict[str, str],
     managed_paths: list[Path],
 ) -> ResolvedTorrent | None:
-    """Resolve a torrent to its per-file layouts, or None to skip."""
+    """Resolve a torrent to its per-file layouts, or None to skip.
+
+    Per-file skip: if a single file in the torrent is not a symlink (e.g. a
+    `.nfo` left as a real file by the migration), or is missing, or resolves
+    outside `managed_paths`, that file is omitted. The torrent as a whole is
+    only skipped when *no* file remains.
+
+    Rationale: real torrents often bundle small extras (.nfo, .txt, covers)
+    next to the main media file. Forcing the entire torrent to be all-or-
+    nothing would exclude most multi-file torrents from the cache. Promoting
+    just the symlinked files is fine — qB seeds extras directly from bulk.
+    """
     save_path_host = map_to_host(torrent.save_path, path_map)
 
     layouts: list[TorrentLayout] = []
     total = 0
+    skipped = 0
     for f in files:
         rel = f["name"]  # POSIX relative path within save_path
         size = int(f["size"])
@@ -133,32 +145,35 @@ def resolve(
 
         if not link.exists() and not link.is_symlink():
             log.debug(
-                "resolve.skip_missing_link",
+                "resolve.skip_file_missing",
                 instance=instance,
                 infohash=torrent.hash,
                 link=str(link),
             )
-            return None
+            skipped += 1
+            continue
 
         if not link.is_symlink():
             log.debug(
-                "resolve.skip_not_symlink",
+                "resolve.skip_file_not_symlink",
                 instance=instance,
                 infohash=torrent.hash,
                 link=str(link),
             )
-            return None
+            skipped += 1
+            continue
 
         bulk_target = Path(os.path.realpath(link))
 
         if managed_paths and not any(_is_under(bulk_target, mp) for mp in managed_paths):
             log.debug(
-                "resolve.skip_unmanaged",
+                "resolve.skip_file_unmanaged",
                 instance=instance,
                 infohash=torrent.hash,
                 bulk=str(bulk_target),
             )
-            return None
+            skipped += 1
+            continue
 
         ssd_target = ssd_cache_dir / torrent.hash / rel
         layouts.append(
@@ -173,7 +188,22 @@ def resolve(
         total += size
 
     if not layouts:
+        log.debug(
+            "resolve.skip_torrent_no_eligible_files",
+            instance=instance,
+            infohash=torrent.hash,
+            skipped_files=skipped,
+        )
         return None
+
+    if skipped:
+        log.debug(
+            "resolve.partial",
+            instance=instance,
+            infohash=torrent.hash,
+            included=len(layouts),
+            skipped=skipped,
+        )
 
     return ResolvedTorrent(
         instance=instance, infohash=torrent.hash, layouts=layouts, total_bytes=total
