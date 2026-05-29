@@ -24,6 +24,11 @@ Per-tick flow:
 Crash recovery: tier rows survive restarts. If a transition is interrupted
 mid-way, the on-disk symlinks + SSD content are authoritative; the next
 tick re-derives the tier from is_hot_on_ssd and converges.
+
+Startup reconciliation: before the first tick, `reconcile_startup` aligns
+the DB with the filesystem using the per-torrent `.qbsc-meta.json` sidecars
+(see `recovery` and `reconcile`). This makes the cache survive a lost or
+replaced DB without losing track of already-promoted content.
 """
 
 from __future__ import annotations
@@ -39,8 +44,9 @@ import structlog
 from .config import Config, InstanceConfig
 from .hotness import HotnessScore
 from .hotness import score as score_history
-from .mover import demote, promote
+from .mover import bulk_targets_of, demote, promote
 from .qbit_client import QbitClient
+from .reconcile import reconcile_startup
 from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, resolve
 from .selector import TorrentCandidate, select_demotions, select_promotions
 from .state import StateStore
@@ -304,20 +310,17 @@ async def _tick(config: Config, store: StateStore) -> None:
     for c in promotions:
         lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(promote, lt.layouts, dry_run=config.dry_run)
+            await asyncio.to_thread(promote, lt.layouts, now_ts=now, dry_run=config.dry_run)
         except Exception:
             log.exception("promote.failed", infohash=c.infohash)
             continue
         if not config.dry_run:
-            bulk_targets = {
-                str(layout.link): str(layout.bulk_target) for layout in lt.layouts
-            }
             store.set_tier(
                 infohash=c.infohash,
                 tier="hot",
                 since_ts=now,
                 ssd_bytes=c.size_bytes,
-                bulk_targets=bulk_targets,
+                bulk_targets=bulk_targets_of(lt.layouts),
             )
     if promotions:
         log.info("tick.promoted", count=len(promotions))
@@ -337,6 +340,14 @@ async def run_daemon(config: Config) -> None:
         marker.touch()
 
     store = StateStore(config.state_db)
+
+    # Reconcile the DB against the filesystem before the first tick. This
+    # rebuilds hot tier rows from the on-disk sidecars when the DB is fresh
+    # or was replaced (the incident that motivated the sidecar), and undoes
+    # promotions whose SSD copy disappeared. Anomalies it cannot repair are
+    # surfaced via the healthcheck.
+    await asyncio.to_thread(reconcile_startup, config, store)
+
     stop = asyncio.Event()
 
     loop = asyncio.get_running_loop()

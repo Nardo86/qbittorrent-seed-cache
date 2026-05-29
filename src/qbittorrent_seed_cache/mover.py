@@ -9,12 +9,20 @@ Cold → Hot (`promote`):
   1. For each unique SSD destination path among the layouts, copy bulk→SSD
      once. The copy is atomic (tmp + rename) and skipped if the destination
      already exists with the right size (resumes after a crash).
-  2. Retarget every layout's symlink to its (absolute) SSD destination.
+  2. Write the recovery sidecar (`.qbsc-meta.json`) recording the
+     link→bulk mapping, *before* the symlinks are retargeted.
+  3. Retarget every layout's symlink to its (absolute) SSD destination.
+
+The ordering of 2 before 3 is deliberate: the sidecar must be on disk
+before any symlink points into the SSD, so that a crash at any point leaves
+state from which the filesystem alone can be reconciled (see
+:mod:`qbittorrent_seed_cache.recovery`).
 
 Hot → Cold (`demote`):
   1. Retarget every layout's symlink to a relative path into the bulk
      filesystem.
-  2. Remove the SSD `<infohash>/` directory once.
+  2. Remove the SSD `<infohash>/` directory once (this also removes the
+     sidecar that lives inside it).
 
 Both helpers expect every layout in the list to share the same infohash.
 """
@@ -27,6 +35,7 @@ from pathlib import Path
 
 import structlog
 
+from . import recovery
 from .symlinks import atomic_retarget, relative_target, remove_tree, safe_copy
 
 log = structlog.get_logger(__name__)
@@ -67,11 +76,22 @@ def _ssd_root(layout: TorrentLayout) -> Path:
     )
 
 
-def promote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
+def bulk_targets_of(layouts: Iterable[TorrentLayout]) -> dict[str, str]:
+    """Build the ``{link path: bulk path}`` map persisted for a hot torrent.
+
+    Shared by the DB tier row and the on-disk recovery sidecar so the two
+    never drift.
+    """
+    return {str(layout.link): str(layout.bulk_target) for layout in layouts}
+
+
+def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False) -> int:
     """Promote a logical torrent to the SSD. Returns bytes copied (sum of unique destinations).
 
     Idempotent w.r.t. SSD content: if the SSD copy already exists with the
     right size, only the symlinks are retargeted.
+
+    ``now_ts`` is stamped into the recovery sidecar as ``since_ts``.
     """
     if not layouts:
         return 0
@@ -105,6 +125,27 @@ def promote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
             if not dry_run:
                 safe_copy(layout.bulk_target, dest)
         total += size
+
+    # Write the recovery sidecar BEFORE retargeting any symlink, so a crash
+    # mid-retarget still leaves the filesystem self-describing. ssd_cache_dir
+    # is the parent of the <infohash> dir.
+    ssd_cache_dir = _ssd_root(layouts[0]).parent
+    bulk_targets = bulk_targets_of(layouts)
+    log.info(
+        "promote.write_meta",
+        infohash=infohash,
+        files=len(bulk_targets),
+        bytes=total,
+        dry_run=dry_run,
+    )
+    if not dry_run:
+        recovery.write_meta(
+            ssd_cache_dir,
+            infohash=infohash,
+            since_ts=now_ts,
+            ssd_bytes=total,
+            bulk_targets=bulk_targets,
+        )
 
     for layout in layouts:
         log.info(

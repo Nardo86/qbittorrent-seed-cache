@@ -48,6 +48,16 @@ A small NAS (e.g. Synology DS214play) with no SSD cache slot will keep its HDDs 
 
 See [docs/architecture.md](docs/architecture.md) for the full design (atomic transitions, multi-qB handling, failure modes).
 
+### Durability & recovery
+
+The SSD cache is disposable, but the `link → bulk file` mapping is not. It is persisted both in the state DB and in a per-torrent sidecar (`<ssd_cache_dir>/<infohash>/.qbsc-meta.json`), so the cache is **self-describing**. At startup the daemon reconciles the two:
+
+- **DB lost or replaced** → hot tier rows are rebuilt from the sidecars (no over-promoting on top of an SSD it forgot about).
+- **SSD dir deleted** → the affected symlinks are retargeted back to bulk and the tier row dropped.
+- **Both lost** → an anomaly marker is set and the container healthcheck goes **unhealthy** for manual repair.
+
+See [State durability & recovery](docs/architecture.md#state-durability--recovery).
+
 ## Quick start
 
 ```bash
@@ -107,7 +117,8 @@ The [`tools/`](tools/) directory bundles one-shot helpers for the surrounding se
 | Atomic promote/demote           | ✅ tested against live qB |
 | Quota & candidate selection     | ✅ per-infohash, multi-instance dedup |
 | Daemon loop                     | ✅ demote → headroom → promote |
-| Tests                           | ✅ 38 pytest, incl. integration |
+| Crash / DB-loss recovery        | ✅ FS sidecars + startup reconciliation |
+| Tests                           | ✅ 56 pytest, incl. integration |
 | CI / image publishing           | ✅ multi-arch (amd64, arm64) |
 
 ## Notes
