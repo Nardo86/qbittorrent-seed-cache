@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from qbittorrent_seed_cache import recovery
 from qbittorrent_seed_cache.mover import TorrentLayout, demote, promote
 from qbittorrent_seed_cache.resolver import (
     ResolvedTorrent,
@@ -87,7 +88,7 @@ def test_promote_dedups_ssd_copy_across_instances(tmp_path: Path) -> None:
         _layout("b", "HASH", link_b, bulk, ssd_target),
     ]
 
-    bytes_copied = promote(layouts)
+    bytes_copied = promote(layouts, now_ts=1000)
 
     # One SSD copy exists, with the right content.
     assert ssd_target.is_file()
@@ -100,6 +101,12 @@ def test_promote_dedups_ssd_copy_across_instances(tmp_path: Path) -> None:
     assert Path(os.readlink(link_a)) == ssd_target
     assert link_b.is_symlink()
     assert Path(os.readlink(link_b)) == ssd_target
+
+    # A recovery sidecar was written for the infohash, recording both links.
+    meta = recovery.read_meta(tmp_path / "ssd", "HASH")
+    assert meta is not None
+    assert meta.bulk_targets == {str(link_a): str(bulk), str(link_b): str(bulk)}
+    assert meta.ssd_bytes == bulk.stat().st_size
 
 
 def test_promote_idempotent_when_ssd_copy_exists(tmp_path: Path) -> None:
@@ -118,7 +125,7 @@ def test_promote_idempotent_when_ssd_copy_exists(tmp_path: Path) -> None:
 
     mtime_before = ssd_target.stat().st_mtime_ns
 
-    promote([_layout("a", "HASH", link, bulk, ssd_target)])
+    promote([_layout("a", "HASH", link, bulk, ssd_target)], now_ts=1000)
 
     # File not rewritten.
     assert ssd_target.stat().st_mtime_ns == mtime_before
@@ -174,10 +181,12 @@ def test_promote_dry_run_makes_no_changes(tmp_path: Path) -> None:
 
     ssd_target = tmp_path / "ssd" / "HASH" / "X.mkv"
 
-    promote([_layout("a", "HASH", link, bulk, ssd_target)], dry_run=True)
+    promote([_layout("a", "HASH", link, bulk, ssd_target)], now_ts=1000, dry_run=True)
 
     assert not ssd_target.exists()
     assert os.readlink(link) == link_target_before
+    # No sidecar written in dry-run.
+    assert recovery.read_meta(tmp_path / "ssd", "HASH") is None
 
 
 def test_promote_rejects_mixed_infohashes() -> None:
@@ -186,4 +195,4 @@ def test_promote_rejects_mixed_infohashes() -> None:
         _layout("b", "HASH-B", Path("/x"), Path("/b"), Path("/s/HASH-B/x")),
     ]
     with pytest.raises(ValueError, match="single infohash"):
-        promote(layouts, dry_run=True)
+        promote(layouts, now_ts=1000, dry_run=True)

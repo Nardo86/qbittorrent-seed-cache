@@ -179,7 +179,13 @@ def resolve(
         if _is_under(link_target, ssd_cache_dir):
             bulk_target_str = (hot_bulk_map or {}).get(str(link))
             if bulk_target_str is None:
-                log.warning(
+                # The symlink points into the SSD but neither the DB nor a
+                # reconciled sidecar told us its bulk origin. Startup
+                # reconciliation normally rebuilds this mapping, so reaching
+                # here at steady state means the torrent's accounting is lost
+                # — log loudly (this is the silent footgun that once filled
+                # the disk) rather than skipping quietly.
+                log.error(
                     "resolve.skip_file_hot_unknown_bulk",
                     instance=instance,
                     infohash=torrent.hash,
