@@ -16,6 +16,9 @@ Per-tick flow:
   6. Cleanup orphans: infohashes with tier='hot' that no longer exist in
      any instance (probably removed from qB) — rm their SSD dir, drop tier.
   7. Apply demotions first (frees SSD bytes).
+  7b. Reclaim SSD dirs that are neither hot nor referenced by a live symlink,
+     and (re)evaluate the anomaly marker from the live view. Steps 6 and 7b
+     are skipped if any instance poll failed (the live set would be partial).
   8. Recompute available headroom.
   9. Apply promotions within headroom (greedy by hotness, capped by
      max_concurrent_promotions). On success, persist the bulk_targets
@@ -41,13 +44,14 @@ import time
 
 import structlog
 
+from . import recovery
 from .config import Config, InstanceConfig
 from .hotness import HotnessScore
 from .hotness import score as score_history
 from .mover import bulk_targets_of, demote, promote
 from .qbit_client import QbitClient
 from .reconcile import reconcile_startup
-from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, resolve
+from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, references_ssd, resolve
 from .selector import TorrentCandidate, select_demotions, select_promotions
 from .state import StateStore
 from .symlinks import remove_tree
@@ -59,13 +63,16 @@ async def _collect_instance(
     instance: InstanceConfig,
     config: Config,
     hot_bulk_maps: dict[str, dict[str, str]],
-) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent]]:
+) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent], set[str]]:
     """Poll one qB instance.
 
     Returns:
       - snapshots: list of (infohash, uploaded_session, upspeed) tuples to record.
       - resolved: list of ResolvedTorrent for torrents that follow the symlink
         convention.
+      - ssd_referenced: infohashes whose live symlinks currently resolve into
+        the SSD cache (whether or not their bulk origin could be recovered).
+        Used to protect referenced cache dirs from orphan reclamation.
 
     `hot_bulk_maps[infohash]` is the persisted {link_path: bulk_path} map for
     torrents already promoted to SSD; passed through to resolve() so that the
@@ -73,6 +80,7 @@ async def _collect_instance(
     """
     snapshots: list[tuple[str, int, int]] = []
     resolved_list: list[ResolvedTorrent] = []
+    ssd_referenced: set[str] = set()
     async with QbitClient(
         name=instance.name,
         url=instance.url,
@@ -94,7 +102,14 @@ async def _collect_instance(
             )
             if r is not None:
                 resolved_list.append(r)
-    return snapshots, resolved_list
+            if references_ssd(
+                torrent=t,
+                files=files,
+                ssd_cache_dir=config.ssd_cache_dir,
+                path_map=instance.path_map,
+            ):
+                ssd_referenced.add(t.hash)
+    return snapshots, resolved_list, ssd_referenced
 
 
 def _aggregate_score(
@@ -201,6 +216,67 @@ def _cleanup_orphans(
     return freed_count
 
 
+def _cleanup_fs_orphans(
+    config: Config, store: StateStore, ssd_referenced: set[str]
+) -> int:
+    """Reclaim `<ssd_cache_dir>/<infohash>/` dirs that nothing uses.
+
+    A dir is in use iff its infohash is hot in the DB OR a live qB symlink
+    currently resolves into it (`ssd_referenced`). Anything else is an orphan
+    — typically a demote that crashed after retargeting the symlink to bulk
+    but before removing the SSD copy, or a torrent removed from qB. Because we
+    require it to be *unreferenced by any live symlink*, deleting it cannot
+    dangle a seed. Reclaiming here (before the headroom recompute) returns the
+    space to the promotion budget.
+    """
+    in_use = set(store.hot_infohashes()) | ssd_referenced
+    reclaimed = 0
+    for infohash, ssd_dir in recovery.iter_ssd_infohash_dirs(config.ssd_cache_dir):
+        if infohash in in_use:
+            continue
+        log.info(
+            "orphan.fs_reclaim",
+            infohash=infohash,
+            ssd_dir=str(ssd_dir),
+            payload=recovery.ssd_dir_has_payload(ssd_dir),
+            dry_run=config.dry_run,
+        )
+        if not config.dry_run:
+            remove_tree(ssd_dir)
+        reclaimed += 1
+    return reclaimed
+
+
+def _evaluate_anomaly(config: Config, store: StateStore, ssd_referenced: set[str]) -> int:
+    """Set or clear the anomaly marker from the live tick view.
+
+    The unrecoverable case: a live symlink resolves into the SSD, but the
+    infohash is neither hot in the DB nor backed by a sidecar — so its
+    link→bulk mapping is lost and we cannot demote it cleanly. This is the
+    silent footgun made visible. With the live qB data in hand each tick, the
+    marker self-corrects: it is set while such a torrent exists and cleared
+    once it no longer does.
+    """
+    hot = set(store.hot_infohashes())
+    unrecoverable = [
+        ih
+        for ih in sorted(ssd_referenced)
+        if ih not in hot and recovery.read_meta(config.ssd_cache_dir, ih) is None
+    ]
+    if config.dry_run:
+        return len(unrecoverable)
+    if unrecoverable:
+        recovery.set_anomaly(
+            config.ssd_cache_dir,
+            "live symlinks point into the SSD with no recoverable mapping:\n"
+            + "\n".join(unrecoverable),
+        )
+        log.error("tick.anomaly_present", count=len(unrecoverable))
+    else:
+        recovery.clear_anomaly(config.ssd_cache_dir)
+    return len(unrecoverable)
+
+
 def _free_ssd_bytes(config: Config, store: StateStore) -> int:
     """Bytes still spendable for new promotions."""
     used = store.hot_total_bytes()
@@ -225,11 +301,15 @@ async def _tick(config: Config, store: StateStore) -> None:
     )
 
     all_resolved: list[ResolvedTorrent] = []
+    ssd_referenced: set[str] = set()
+    poll_ok = True
     for instance, result in zip(config.instances, instance_results, strict=True):
         if isinstance(result, BaseException):
             log.error("instance.poll_failed", instance=instance.name, error=str(result))
+            poll_ok = False
             continue
-        snapshots, resolved_list = result
+        snapshots, resolved_list, refs = result
+        ssd_referenced |= refs
         for infohash, uploaded, upspeed in snapshots:
             await asyncio.to_thread(
                 store.record,
@@ -262,12 +342,16 @@ async def _tick(config: Config, store: StateStore) -> None:
     )
     _bootstrap_tier(candidates, logical, store, now_ts=now)
 
-    # 6. Cleanup orphans (hot tier but no live torrent).
-    orphans_dropped = await asyncio.to_thread(
-        _cleanup_orphans, set(logical.keys()), config, store
-    )
-    if orphans_dropped:
-        log.info("tick.orphans_cleaned", count=orphans_dropped)
+    # 6. Cleanup orphans (hot tier but no live torrent) — only when every
+    #    instance polled cleanly. With a down instance, `logical` omits its
+    #    torrents, which would make us drop the SSD copy of content that is
+    #    still being seeded there.
+    if poll_ok:
+        orphans_dropped = await asyncio.to_thread(
+            _cleanup_orphans, set(logical.keys()), config, store
+        )
+        if orphans_dropped:
+            log.info("tick.orphans_cleaned", count=orphans_dropped)
 
     # 7. Demote first.
     demotions = select_demotions(
@@ -287,6 +371,20 @@ async def _tick(config: Config, store: StateStore) -> None:
             store.set_tier(infohash=c.infohash, tier="cold", since_ts=now, ssd_bytes=0)
     if demotions:
         log.info("tick.demoted", count=len(demotions))
+
+    # 7b. Reclaim orphaned SSD dirs + (re)evaluate the anomaly marker, but
+    #     only when every instance polled cleanly — a down instance would
+    #     make `ssd_referenced` incomplete and risk reclaiming a dir its
+    #     torrents still use.
+    if poll_ok:
+        reclaimed = await asyncio.to_thread(
+            _cleanup_fs_orphans, config, store, ssd_referenced
+        )
+        if reclaimed:
+            log.info("tick.fs_orphans_reclaimed", count=reclaimed)
+        await asyncio.to_thread(_evaluate_anomaly, config, store, ssd_referenced)
+    else:
+        log.warning("tick.skip_orphan_reclaim_poll_incomplete")
 
     # 8. Recompute headroom.
     available = await asyncio.to_thread(_free_ssd_bytes, config, store)

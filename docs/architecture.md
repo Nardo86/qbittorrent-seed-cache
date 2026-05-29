@@ -73,9 +73,18 @@ Before the first poll, `reconcile_startup` aligns the DB with the filesystem:
 |----------|--------------|
 | **DB fresh / lost, SSD intact** | Rebuilds the hot tier rows from the sidecars. Without this the daemon would think the SSD is empty and over-promote on top of the existing cache until the disk fills. |
 | **SSD dir deleted, DB intact** | The hot row's `<infohash>/` dir is gone, so its symlinks dangle. Retargets them back to the bulk fs (from `bulk_targets`) and drops the tier row — a demotion with nothing to delete. |
-| **Both lost** | The mapping is unrecoverable automatically. Logs the affected infohash and drops an **anomaly marker** (`.qbsc-anomaly`) in the SSD cache dir; the container healthcheck then reports **unhealthy**. An operator repairs the symlinks by hand (e.g. `migrate-hardlinks-to-symlinks.py`) or re-downloads. |
+| **SSD dir with no recoverable mapping** | Deferred — reconcile can't tell a safe orphan from a real anomaly without qB's live data, so it leaves the dir for the first tick to judge (see below). |
 
 A currently-hot torrent that the DB knows about but that predates the sidecar mechanism gets a sidecar written from the DB row (forward migration), so a *future* DB loss is covered.
+
+### Orphan reclamation and the anomaly marker (tick-time)
+
+An SSD `<infohash>/` dir with no recoverable mapping is either a **safe orphan** (nothing references it — e.g. a demote that crashed after retargeting the symlink to bulk but before the `rm`) or a **genuine anomaly** (a live symlink still points into it but the link→bulk mapping is gone). Telling them apart needs qB's live file list, which only exists during a tick — so the tick owns both:
+
+- **Reclamation** (`_cleanup_fs_orphans`): a dir is *in use* iff its infohash is hot in the DB **or** a live qB symlink resolves into it this tick. Anything else is removed — safe by construction, since nothing references it.
+- **Anomaly marker** (`_evaluate_anomaly`): set while a live symlink resolves into the SSD for an infohash that is neither hot nor backed by a sidecar; cleared once no such torrent remains. The marker self-corrects each tick instead of going stale.
+
+Both run only when **every** instance polled cleanly that tick — a down instance would make the "referenced" set incomplete and risk reclaiming a dir its torrents still use. The same guard protects the hot-tier orphan cleanup.
 
 > **Why this matters:** the original incident was a daemon migration that started against a fresh DB while ~170 GB of already-promoted content sat on the SSD. The DB reported 0 bytes used, so the daemon promoted another ~150 GB on top and filled the disk. The sidecar + reconciliation closes that hole: the filesystem alone now carries enough state to rebuild the accounting.
 
@@ -86,7 +95,8 @@ A currently-hot torrent that the DB knows about but that predates the sidecar me
 | SSD dies entirely                      | All "hot" symlinks dangle. Re-run `migrate-hardlinks-to-symlinks.py` (or equivalent) to rebuild relative cold symlinks; the mover repopulates the SSD over the next ticks. |
 | State DB lost / replaced / corrupt     | Startup reconciliation rebuilds the hot tier rows from the on-disk sidecars (see [State durability & recovery](#state-durability--recovery)). Accounting is restored before the first promotion, so the daemon does not over-promote. |
 | SSD cache dir(s) deleted, DB intact    | Startup reconciliation retargets the affected symlinks back to bulk and drops the tier rows. |
-| Both DB and a cache dir lost           | Unrecoverable automatically: the anomaly marker is set and the healthcheck reports unhealthy for manual repair. |
+| Crashed demote (symlink→bulk done, SSD dir left) | Reclaimed automatically at tick time once it's unreferenced (`_cleanup_fs_orphans`). |
+| Live symlink → SSD with lost mapping   | Flagged at tick time: anomaly marker set, healthcheck unhealthy, until the torrent is repaired or removed. |
 | qB restarts (counters reset)           | State store detects `uploaded_session` going backwards and treats the new value as the delta from zero. Hotness score is briefly noisy until window refills. |
 | Mover restarts                         | State persists in SQLite **and** the sidecars. Hotness score is restored from the rolling window. Worst case: one tick of stale data. |
 | Bulk fs unmounted                      | Promotions fail loudly (source missing). Existing hot torrents keep seeding from SSD until they're demoted; demotion is blocked because the relative symlink would dangle. The daemon should refuse to operate (`bulk_root` check) until it's back. |

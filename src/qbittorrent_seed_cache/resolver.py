@@ -243,6 +243,29 @@ def resolve(
     )
 
 
+def references_ssd(
+    *,
+    torrent: TorrentInfo,
+    files: list[dict[str, Any]],
+    ssd_cache_dir: Path,
+    path_map: dict[str, str],
+) -> bool:
+    """True if any of the torrent's file symlinks currently resolve into the SSD.
+
+    Independent of whether the bulk origin can be recovered — it only asks
+    "does a live symlink point into the cache?". The tick uses this to decide
+    which `<ssd_cache_dir>/<infohash>/` dirs are still referenced and must not
+    be reclaimed as orphans, and to detect symlinks into the SSD whose mapping
+    is lost (an unrecoverable anomaly).
+    """
+    save_path_host = map_to_host(torrent.save_path, path_map)
+    for f in files:
+        link = save_path_host / f["name"]
+        if link.is_symlink() and _is_under(Path(os.path.realpath(link)), ssd_cache_dir):
+            return True
+    return False
+
+
 def _is_under(p: Path, root: Path) -> bool:
     try:
         p.relative_to(root)

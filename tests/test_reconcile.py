@@ -88,7 +88,6 @@ def test_reconcile_rebuilds_tier_from_sidecar(tmp_path: Path) -> None:
         report = reconcile_startup(config, store)
 
         assert report.rebuilt == 1
-        assert report.anomalies == []
         tier = store.get_tier(infohash="HASHA")
         assert tier is not None and tier.tier == "hot"
         assert tier.bulk_targets == {str(link): str(bulk)}
@@ -151,7 +150,6 @@ def test_reconcile_demotes_when_ssd_dir_missing(tmp_path: Path) -> None:
         report = reconcile_startup(config, store)
 
         assert report.redemoted == 1
-        assert report.anomalies == []
         # Tier dropped, symlink repaired to the bulk file (relative).
         assert store.get_tier(infohash="HASHB") is None
         assert link.is_symlink()
@@ -162,28 +160,33 @@ def test_reconcile_demotes_when_ssd_dir_missing(tmp_path: Path) -> None:
         store.close()
 
 
-# --- case C: unrecoverable -> anomaly --------------------------------------
+# --- unmapped SSD dir: deferred to the tick, no anomaly at reconcile -------
 
 
-def test_reconcile_flags_anomaly_for_ssd_dir_without_sidecar_or_db(tmp_path: Path) -> None:
+def test_reconcile_defers_unmapped_ssd_dir(tmp_path: Path) -> None:
+    """An SSD dir with content but no sidecar and no DB row can't be judged at
+    startup (orphan vs data-loss needs live qB data). Reconcile defers it and
+    must NOT touch the anomaly marker — that's the tick's job."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
-    # SSD dir with a real file but no sidecar, and nothing in the DB.
     make_promoted_on_disk(tmp_path, ssd, "HASHC", write_sidecar=False)
 
     config = make_config(tmp_path, ssd)
     store = StateStore(config.state_db)
     try:
         report = reconcile_startup(config, store)
-        assert report.anomalies
-        assert recovery.has_anomaly(ssd) is True
+        assert report.deferred == 1
+        # Reconcile never sets the marker.
+        assert recovery.has_anomaly(ssd) is False
+        # The dir is left intact for the tick to reclaim or flag.
+        assert (ssd / "HASHC").is_dir()
     finally:
         store.close()
 
 
 def test_reconcile_ignores_empty_dir(tmp_path: Path) -> None:
     """An empty (payload-less) SSD subdir — e.g. a stray artifact like the
-    legacy `files/` dir — must not be flagged as an anomaly."""
+    legacy `files/` dir — must not be deferred or flagged."""
     ssd = tmp_path / "ssd"
     (ssd / "files").mkdir(parents=True)  # empty, no sidecar, not in DB
 
@@ -191,23 +194,25 @@ def test_reconcile_ignores_empty_dir(tmp_path: Path) -> None:
     store = StateStore(config.state_db)
     try:
         report = reconcile_startup(config, store)
-        assert report.anomalies == []
+        assert report.deferred == 0
         assert recovery.has_anomaly(ssd) is False
     finally:
         store.close()
 
 
-def test_reconcile_flags_anomaly_for_hot_row_without_mapping(tmp_path: Path) -> None:
+def test_reconcile_drops_unrepairable_hot_row(tmp_path: Path) -> None:
+    """A hot row with no bulk_targets and no SSD dir is stale garbage: drop it
+    (nothing to retarget, nothing to clean). No marker from reconcile."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     config = make_config(tmp_path, ssd)
     store = StateStore(config.state_db)
     try:
-        # Hot row, no bulk_targets, and no SSD dir on disk.
         store.set_tier(infohash="HASHD", tier="hot", since_ts=1, ssd_bytes=10)
         report = reconcile_startup(config, store)
-        assert report.anomalies
-        assert recovery.has_anomaly(ssd) is True
+        assert report.dropped == 1
+        assert store.get_tier(infohash="HASHD") is None
+        assert recovery.has_anomaly(ssd) is False
     finally:
         store.close()
 
@@ -233,7 +238,6 @@ def test_reconcile_forward_migrates_legacy_promotion(tmp_path: Path) -> None:
         report = reconcile_startup(config, store)
 
         assert report.sidecars_written == 1
-        assert report.anomalies == []
         # A sidecar now exists so a future DB loss is covered.
         meta = recovery.read_meta(ssd, "HASHLEG")
         assert meta is not None
@@ -249,17 +253,19 @@ def test_reconcile_forward_migrates_legacy_promotion(tmp_path: Path) -> None:
 
 
 def test_reconcile_dry_run_makes_no_changes(tmp_path: Path) -> None:
+    """Dry-run reports what it would do (rebuild from sidecar) but mutates
+    neither the DB nor the filesystem."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
-    make_promoted_on_disk(tmp_path, ssd, "HASHDRY", write_sidecar=False)
+    make_promoted_on_disk(tmp_path, ssd, "HASHDRY", content=b"q" * 256)  # sidecar written
 
     config = make_config(tmp_path, ssd, dry_run=True)
-    store = StateStore(config.state_db)
+    store = StateStore(config.state_db)  # fresh DB
     try:
         report = reconcile_startup(config, store)
-        # It still reports the anomaly it found...
-        assert report.anomalies
-        # ...but writes no marker in dry-run.
+        # Would rebuild, but the DB stays empty in dry-run.
+        assert report.rebuilt == 1
+        assert store.get_tier(infohash="HASHDRY") is None
         assert recovery.has_anomaly(ssd) is False
     finally:
         store.close()
