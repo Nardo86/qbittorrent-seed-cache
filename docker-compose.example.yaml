@@ -74,6 +74,13 @@ services:
       - QBSC_CONFIG=/etc/qbittorrent-seed-cache/config.yaml
     volumes:
       - /var/lib/seed-cache:/var/lib/seed-cache
+      # Bulk filesystem: read-only by default, EXCEPT the managed storage
+      # subtree where the mover must WRITE the torrents/<release>/ symlinks
+      # it retargets on promote/demote. The more specific rw bind shadows
+      # the ro parent for that subtree. Without rw here every retarget fails
+      # with "Read-only file system" (EROFS) and promotions never complete.
+      # This path must match `managed_paths` in config.yaml.
       - /mnt/media:/mnt/media:ro
+      - /mnt/media/storage:/mnt/media/storage:rw
       - ./config.yaml:/etc/qbittorrent-seed-cache/config.yaml:ro
     restart: unless-stopped

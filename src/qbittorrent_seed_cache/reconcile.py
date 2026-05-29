@@ -17,12 +17,14 @@ B. **SSD dir deleted, DB intact.** A hot tier row exists but its
    back to the bulk filesystem using the DB's ``bulk_targets`` and drop the
    tier row — i.e. a demotion with no SSD to remove.
 
-C. **Both lost (unrecoverable).** An SSD directory with neither a usable
-   sidecar nor a DB row, or a hot DB row with no ``bulk_targets`` and a
-   missing SSD dir. The link→bulk mapping is simply gone; we cannot repair
-   it automatically. We log the affected infohash and raise an anomaly
-   marker so the container healthcheck reports unhealthy, leaving the
-   operator to repair the symlinks by hand (or re-download).
+C. **Both lost (unrecoverable).** An SSD directory *with real content* but
+   neither a usable sidecar nor a DB row, or a hot DB row with no
+   ``bulk_targets`` and a missing SSD dir. The link→bulk mapping is simply
+   gone; we cannot repair it automatically. We log the affected infohash and
+   raise an anomaly marker so the container healthcheck reports unhealthy,
+   leaving the operator to repair the symlinks by hand (or re-download).
+   (Empty / payload-less directories are *not* anomalies — they carry no
+   data and nothing references them, so they are skipped silently.)
 
 As a forward-migration nicety, any currently-hot torrent that the DB knows
 about but that predates the sidecar mechanism gets a sidecar written from
@@ -102,6 +104,14 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
 
         if meta is None:
             # SSD dir without a usable sidecar.
+            if not recovery.ssd_dir_has_payload(ssd_dir):
+                # Empty / payload-less directory (a stray mountpoint artifact,
+                # a leftover from an earlier layout, or a dir whose files were
+                # removed out of band). There is nothing to recover and
+                # nothing at risk — skip it quietly rather than flagging a
+                # false anomaly.
+                log.debug("reconcile.skip_empty_dir", infohash=infohash, ssd_dir=str(ssd_dir))
+                continue
             if tier is not None and tier.tier == "hot" and tier.bulk_targets:
                 # Legacy promotion (pre-sidecar). DB still has the mapping —
                 # forward-migrate by writing a sidecar from the DB row.

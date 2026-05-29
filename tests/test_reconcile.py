@@ -181,6 +181,22 @@ def test_reconcile_flags_anomaly_for_ssd_dir_without_sidecar_or_db(tmp_path: Pat
         store.close()
 
 
+def test_reconcile_ignores_empty_dir(tmp_path: Path) -> None:
+    """An empty (payload-less) SSD subdir — e.g. a stray artifact like the
+    legacy `files/` dir — must not be flagged as an anomaly."""
+    ssd = tmp_path / "ssd"
+    (ssd / "files").mkdir(parents=True)  # empty, no sidecar, not in DB
+
+    config = make_config(tmp_path, ssd)
+    store = StateStore(config.state_db)
+    try:
+        report = reconcile_startup(config, store)
+        assert report.anomalies == []
+        assert recovery.has_anomaly(ssd) is False
+    finally:
+        store.close()
+
+
 def test_reconcile_flags_anomaly_for_hot_row_without_mapping(tmp_path: Path) -> None:
     ssd = tmp_path / "ssd"
     ssd.mkdir()

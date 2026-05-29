@@ -17,6 +17,8 @@ The reason: a "hot" torrent's symlink points to the **absolute** SSD path. If qB
 
 The opposite is true for "cold" symlinks: they point into the bulk filesystem with a **relative** target. As long as `torrents/` and the bulk subtrees (e.g. `Films/`) live under the same shared mount, the relative symlink works regardless of what each container calls the mount root.
 
+> **The mover needs write access to the bulk `torrents/` subtree.** Promote and demote both *rewrite* the `torrents/<release>/<file>` symlink (swapping it between the relative bulk target and the absolute SSD target). Those symlinks live in the bulk filesystem (under a `managed_paths` entry), so the mover's bind mount of that subtree must be **read-write**. Mounting the bulk read-only makes every retarget fail with `EROFS` *after* the SSD copy is made — promotions never complete, orphan SSD dirs accumulate, and the cache re-copies the same data each tick. Mount the rest of the bulk read-only if you like, but the managed subtree must be rw (see `docker-compose.example.yaml`).
+
 ## Atomic transitions
 
 ### Promote (cold → hot)
