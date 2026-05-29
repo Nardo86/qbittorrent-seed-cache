@@ -1,7 +1,7 @@
 """Startup reconciliation between the DB and the SSD filesystem.
 
-Run once, before the first poll tick. It converges three drift scenarios
-that a plain restart of the daemon would otherwise mishandle:
+Run once, before the first poll tick. It restores DB state that can be
+recovered from the filesystem alone:
 
 A. **DB fresh / lost, SSD intact.** The cache directories and their
    ``.qbsc-meta.json`` sidecars are on disk but the DB has no hot tier rows
@@ -15,16 +15,17 @@ B. **SSD dir deleted, DB intact.** A hot tier row exists but its
    ``<infohash>/`` directory is gone (manual cleanup, disk wipe). The
    torrent's symlinks now dangle into a missing SSD path. We retarget them
    back to the bulk filesystem using the DB's ``bulk_targets`` and drop the
-   tier row — i.e. a demotion with no SSD to remove.
+   tier row — i.e. a demotion with no SSD to remove. A hot row with no
+   ``bulk_targets`` can't be repaired, so we just drop the stale row.
 
-C. **Both lost (unrecoverable).** An SSD directory *with real content* but
-   neither a usable sidecar nor a DB row, or a hot DB row with no
-   ``bulk_targets`` and a missing SSD dir. The link→bulk mapping is simply
-   gone; we cannot repair it automatically. We log the affected infohash and
-   raise an anomaly marker so the container healthcheck reports unhealthy,
-   leaving the operator to repair the symlinks by hand (or re-download).
-   (Empty / payload-less directories are *not* anomalies — they carry no
-   data and nothing references them, so they are skipped silently.)
+What reconciliation deliberately does **not** do is judge orphans or raise
+anomalies. Deciding whether an SSD dir with no recoverable mapping is a safe
+orphan (nothing references it → reclaim) or a genuine data-loss anomaly (a
+live symlink points into it → flag) requires qB's live file list. That only
+exists at tick time, so the daemon's tick owns both orphan reclamation
+(``_cleanup_fs_orphans``) and the anomaly marker (``_evaluate_anomaly``).
+Here we simply skip such dirs (counting them as ``deferred``) and let the
+first tick resolve them with full information.
 
 As a forward-migration nicety, any currently-hot torrent that the DB knows
 about but that predates the sidecar mechanism gets a sidecar written from
@@ -33,7 +34,7 @@ the DB row, so a *future* DB loss is covered.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
@@ -48,10 +49,11 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class ReconcileReport:
-    rebuilt: int = 0          # hot tier rows rebuilt from sidecars (case A)
+    rebuilt: int = 0           # hot tier rows rebuilt from sidecars (case A)
     sidecars_written: int = 0  # forward-migration sidecars written
-    redemoted: int = 0        # hot rows whose SSD dir vanished, demoted (case B)
-    anomalies: list[str] = field(default_factory=list)  # unrecoverable (case C)
+    redemoted: int = 0         # hot rows whose SSD dir vanished, demoted (case B)
+    dropped: int = 0           # unrepairable hot rows dropped (no bulk_targets)
+    deferred: int = 0          # unmapped SSD dirs left for the tick to judge
 
 
 def _rebuild_from_sidecar(
@@ -89,7 +91,7 @@ def _retarget_to_bulk(infohash: str, bulk_targets: dict[str, str], *, dry_run: b
 
 
 def reconcile(config: Config, store: StateStore) -> ReconcileReport:
-    """Pure-ish reconciliation pass. Returns a report; does not touch the marker."""
+    """Reconcile DB against the filesystem. Returns a report; never touches the marker."""
     report = ReconcileReport()
     ssd_cache_dir = config.ssd_cache_dir
     dry_run = config.dry_run
@@ -107,9 +109,7 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
             if not recovery.ssd_dir_has_payload(ssd_dir):
                 # Empty / payload-less directory (a stray mountpoint artifact,
                 # a leftover from an earlier layout, or a dir whose files were
-                # removed out of band). There is nothing to recover and
-                # nothing at risk — skip it quietly rather than flagging a
-                # false anomaly.
+                # removed out of band). Nothing to recover, nothing at risk.
                 log.debug("reconcile.skip_empty_dir", infohash=infohash, ssd_dir=str(ssd_dir))
                 continue
             if tier is not None and tier.tier == "hot" and tier.bulk_targets:
@@ -126,8 +126,10 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
                     )
                 report.sidecars_written += 1
             else:
-                log.error("reconcile.unattributable_ssd_dir", infohash=infohash, ssd_dir=str(ssd_dir))
-                report.anomalies.append(f"ssd dir without sidecar or DB mapping: {infohash}")
+                # Payload but no recoverable mapping. Could be a safe orphan or
+                # a real anomaly — only the tick (with live qB data) can tell.
+                log.info("reconcile.defer_unmapped_ssd_dir", infohash=infohash, ssd_dir=str(ssd_dir))
+                report.deferred += 1
             continue
 
         # Sidecar present and valid.
@@ -149,13 +151,17 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
             continue
         ssd_dir = ssd_cache_dir / infohash
         if recovery.ssd_dir_has_payload(ssd_dir):
-            # Present after all (e.g. dir exists but iterating skipped it for
-            # some reason) — leave it for the normal tick to handle.
+            # Present after all — leave it for the normal tick to handle.
             continue
         tier = store.get_tier(infohash=infohash)
         if tier is None or not tier.bulk_targets:
-            log.error("reconcile.missing_ssd_no_mapping", infohash=infohash)
-            report.anomalies.append(f"hot DB row, SSD dir gone, no bulk_targets: {infohash}")
+            # Can't retarget without the mapping; the row is stale garbage
+            # (no SSD to clean either). Drop it. If a live symlink still
+            # points into the missing SSD path, the tick flags the anomaly.
+            log.warning("reconcile.drop_unrepairable_hot_row", infohash=infohash)
+            if not dry_run:
+                store.delete_tier(infohash=infohash)
+            report.dropped += 1
             continue
         log.warning("reconcile.demote_missing_ssd", infohash=infohash, ssd_dir=str(ssd_dir))
         _retarget_to_bulk(infohash, tier.bulk_targets, dry_run=dry_run)
@@ -167,26 +173,15 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
 
 
 def reconcile_startup(config: Config, store: StateStore) -> ReconcileReport:
-    """Run reconciliation and (un)set the anomaly marker based on the result."""
+    """Run reconciliation and log a summary. The anomaly marker is owned by the tick."""
     report = reconcile(config, store)
-
     log.info(
         "reconcile.done",
         rebuilt=report.rebuilt,
         sidecars_written=report.sidecars_written,
         redemoted=report.redemoted,
-        anomalies=len(report.anomalies),
+        dropped=report.dropped,
+        deferred=report.deferred,
         dry_run=config.dry_run,
     )
-
-    if config.dry_run:
-        return report
-
-    if report.anomalies:
-        detail = "\n".join(report.anomalies)
-        recovery.set_anomaly(config.ssd_cache_dir, detail)
-        log.error("reconcile.anomalies_present", count=len(report.anomalies))
-    else:
-        recovery.clear_anomaly(config.ssd_cache_dir)
-
     return report

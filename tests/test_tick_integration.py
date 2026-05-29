@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from qbittorrent_seed_cache import recovery
 from qbittorrent_seed_cache.config import Config, HotnessConfig, InstanceConfig
 from qbittorrent_seed_cache.daemon import _tick
 from qbittorrent_seed_cache.qbit_client import TorrentInfo
@@ -438,5 +439,90 @@ async def test_hot_torrent_survives_subsequent_tick(
         assert tier_after_2 is not None and tier_after_2.tier == "hot"
         # Symlink still pointing at the SSD.
         assert Path(os.readlink(link)) == ssd_file
+    finally:
+        store.close()
+
+
+async def test_tick_reclaims_unreferenced_fs_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SSD cache dir that is neither hot in the DB nor referenced by any
+    live qB symlink (e.g. a demote that crashed before the rm) is reclaimed."""
+    bulk_root, ssd = make_dirs(tmp_path)
+
+    data: dict[str, dict[str, Any]] = {"qb1": {"torrents": [], "files": {}}}
+    monkeypatch.setattr(
+        "qbittorrent_seed_cache.daemon.QbitClient", make_fake_client(data)
+    )
+    config = make_config(tmp_path, bulk_root=bulk_root, ssd=ssd, instance_names=["qb1"])
+
+    store = StateStore(config.state_db)
+    try:
+        # Orphan SSD dir with content, no DB row, no live torrent references it.
+        orphan = ssd / "FSORPHAN"
+        orphan.mkdir()
+        (orphan / "movie.mkv").write_bytes(b"x" * 100)
+
+        await _tick(config, store)
+
+        assert not orphan.exists()
+        assert recovery.has_anomaly(ssd) is False
+    finally:
+        store.close()
+
+
+async def test_tick_flags_then_clears_anomaly_for_unmapped_live_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live torrent whose symlink resolves into the SSD but whose mapping is
+    lost (no sidecar, no DB row) is an unrecoverable anomaly: the marker is
+    set. It is NOT reclaimed (a live symlink points into it). When the torrent
+    later disappears, the dir is reclaimed and the marker clears."""
+    bulk_root, ssd = make_dirs(tmp_path)
+    storage = bulk_root / "storage"
+
+    # SSD content with NO sidecar.
+    ssd_file = ssd / "HASHLOST" / "movie.mkv"
+    ssd_file.parent.mkdir(parents=True)
+    ssd_file.write_bytes(b"x" * 100)
+
+    # A live torrent whose save-dir symlink points (absolutely) into the SSD.
+    save_dir = storage / "torrents" / "rel-Lost"
+    save_dir.mkdir(parents=True)
+    os.symlink(ssd_file, save_dir / "movie.mkv")
+
+    ti = TorrentInfo(
+        hash="HASHLOST", name="rel-Lost",
+        save_path="/data/torrents/rel-Lost", content_path="/data/torrents/rel-Lost",
+        size=100, upspeed=0, uploaded_session=0,
+        last_activity=int(time.time()), state="uploading",
+    )
+    files = [{"name": "movie.mkv", "size": 100}]
+
+    data: dict[str, dict[str, Any]] = {
+        "qb1": {"torrents": [ti], "files": {"HASHLOST": files}}
+    }
+    fake = make_fake_client(data)
+    monkeypatch.setattr("qbittorrent_seed_cache.daemon.QbitClient", fake)
+    config = make_config(tmp_path, bulk_root=bulk_root, ssd=ssd, instance_names=["qb1"])
+
+    store = StateStore(config.state_db)
+    try:
+        await _tick(config, store)
+
+        # Anomaly raised; the dir is NOT reclaimed (a live symlink references it).
+        assert recovery.has_anomaly(ssd) is True
+        assert ssd_file.exists()
+
+        # Torrent disappears from qB → no longer referenced.
+        empty: dict[str, dict[str, Any]] = {"qb1": {"torrents": [], "files": {}}}
+        monkeypatch.setattr(
+            "qbittorrent_seed_cache.daemon.QbitClient", make_fake_client(empty)
+        )
+        await _tick(config, store)
+
+        # Now reclaimed and the marker cleared.
+        assert not (ssd / "HASHLOST").exists()
+        assert recovery.has_anomaly(ssd) is False
     finally:
         store.close()
