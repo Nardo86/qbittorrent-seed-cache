@@ -21,6 +21,7 @@ the daemon:
 3. Promotes "hot" torrents to the SSD: `cp` the bulk file → SSD, then **atomically retarget** the symlink in `torrents/` to the SSD copy. One read from the HDD; after that all seeding I/O hits the SSD.
 4. Demotes "cold" torrents: retarget the symlink back to the bulk file, delete the SSD copy. Zero writes to the HDD.
 5. Respects a soft quota (default 100 GB) using a "young + sticky" policy to avoid flapping.
+6. When the quota is full of lukewarm-but-not-cold torrents, **evicts the least *dense* hot torrents to make room for denser cold ones** (displacement). "Density" is upload/day per byte of SSD occupied, so a huge low-density pack can't push out several small high-density releases that together serve far more. A cold torrent only displaces a hot one when its density is at least `displacement_factor`× the victim's — hysteresis that keeps similar-density torrents from swapping SSD slots every tick.
 
 The real file never moves. If the SSD dies, you regenerate the symlinks from the bulk filesystem and you are back to a fully-cold state.
 
@@ -95,8 +96,13 @@ hotness:
   window_days: 14
   promote_min_upload_mb: 50
   demote_max_upload_mb: 5
+  # A cold torrent must have >= this multiple of a hot torrent's density
+  # (upload/day per GB) to evict it when the cache is full. >1 = hysteresis.
+  displacement_factor: 2.0
 
 poll_interval_sec: 300
+# Max hot torrents evicted per tick by the displacement policy.
+max_displacements_per_tick: 8
 ```
 
 ## Setup helpers
@@ -116,9 +122,9 @@ The [`tools/`](tools/) directory bundles one-shot helpers for the surrounding se
 | Hotness rolling window          | ✅ EMA with reset detection |
 | Atomic promote/demote           | ✅ tested against live qB |
 | Quota & candidate selection     | ✅ per-infohash, multi-instance dedup |
-| Daemon loop                     | ✅ demote → headroom → promote |
+| Daemon loop                     | ✅ demote → displace → headroom → promote |
 | Crash / DB-loss recovery        | ✅ FS sidecars + startup reconciliation |
-| Tests                           | ✅ 56 pytest, incl. integration |
+| Tests                           | ✅ 68 pytest, incl. integration |
 | CI / image publishing           | ✅ multi-arch (amd64, arm64) |
 
 ## Notes

@@ -52,7 +52,12 @@ from .mover import bulk_targets_of, demote, promote
 from .qbit_client import QbitClient
 from .reconcile import reconcile_startup
 from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, references_ssd, resolve
-from .selector import TorrentCandidate, select_demotions, select_promotions
+from .selector import (
+    TorrentCandidate,
+    select_demotions,
+    select_displacements,
+    select_promotions,
+)
 from .state import StateStore
 from .symlinks import remove_tree
 
@@ -390,12 +395,44 @@ async def _tick(config: Config, store: StateStore) -> None:
     available = await asyncio.to_thread(_free_ssd_bytes, config, store)
     log.info("tick.headroom_bytes", bytes=available)
 
-    # 9. Promote within headroom.
     max_size_bytes = (
         int(config.max_torrent_size_gb * 1024**3)
         if config.max_torrent_size_gb is not None
         else None
     )
+
+    # 8c. Displacement: when the cache is full of lukewarm torrents that never
+    #     drop below `demote_max`, evict the least *dense* hot ones to make room
+    #     for denser cold candidates (density = upload/day per byte; a candidate
+    #     must beat its victim's density by displacement_factor). Eviction frees
+    #     SSD without an HDD read; the promote step below fills the headroom.
+    displacements = select_displacements(
+        candidates,
+        now_ts=now,
+        available_bytes=available,
+        promote_min_mb=config.hotness.promote_min_upload_mb,
+        min_hot_minutes=config.hotness.min_hot_minutes,
+        min_cold_minutes=config.hotness.min_cold_minutes,
+        displacement_factor=config.hotness.displacement_factor,
+        max_promotions=config.max_concurrent_promotions,
+        max_evictions=config.max_displacements_per_tick,
+        max_size_bytes=max_size_bytes,
+    )
+    for c in displacements:
+        lt = logical[c.infohash]
+        try:
+            await asyncio.to_thread(demote, lt.layouts, dry_run=config.dry_run)
+        except Exception:
+            log.exception("displace.failed", infohash=c.infohash)
+            continue
+        if not config.dry_run:
+            store.set_tier(infohash=c.infohash, tier="cold", since_ts=now, ssd_bytes=0)
+    if displacements:
+        log.info("tick.displaced", count=len(displacements))
+        available = await asyncio.to_thread(_free_ssd_bytes, config, store)
+        log.info("tick.headroom_bytes", bytes=available, after="displace")
+
+    # 9. Promote within headroom.
     promotions = select_promotions(
         candidates,
         now_ts=now,

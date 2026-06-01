@@ -27,6 +27,13 @@ class HotnessConfig(BaseModel):
     demote_max_upload_mb: float = Field(5, ge=0)
     min_hot_minutes: int = Field(60, ge=0)
     min_cold_minutes: int = Field(120, ge=0)
+    # When the SSD is full, a cold torrent may evict ("displace") a torrent
+    # already in the hot tier only if its density (upload/day per byte of SSD
+    # occupied) is at least this multiple of the victim's. Density, not absolute
+    # rate, so a huge low-density pack can't push out several small dense ones.
+    # >1 gives hysteresis so two torrents of similar density don't swap SSD
+    # slots tick after tick. 1.0 disables the margin (evict on any improvement).
+    displacement_factor: float = Field(2.0, ge=1.0)
 
     @field_validator("demote_max_upload_mb")
     @classmethod
@@ -62,6 +69,11 @@ class Config(BaseModel):
 
     dry_run: bool = False
     max_concurrent_promotions: int = Field(1, gt=0)
+    # Upper bound on hot torrents evicted per tick by the displacement policy.
+    # Eviction is cheap (no HDD read), but bounding it keeps a single tick from
+    # mass-rebalancing the whole cache. Set independently of promotions because
+    # several small victims may be needed to free room for one larger torrent.
+    max_displacements_per_tick: int = Field(8, gt=0)
 
     @field_validator("instances")
     @classmethod
