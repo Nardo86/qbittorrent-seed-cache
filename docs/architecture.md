@@ -42,6 +42,37 @@ Crash between step 2 and step 5: the SSD copy (and possibly the sidecar) is orph
 
 Crash between step 3 and step 4: orphan SSD content. Cleaned up on next tick.
 
+### Displacement (eviction when the cache is full)
+
+Plain demotion only retires torrents that have themselves gone cold (below
+`demote_max_upload_mb`). A cache full of *lukewarm* torrents — above the demote
+threshold but far less valuable than the best cold candidates — therefore never
+makes room for a more valuable torrent: there is no headroom and nothing is
+demotable. Displacement closes that gap. Per tick, between the demote and
+promote steps, the daemon may evict the **least dense hot** torrents so the
+freed space lets the **densest cold** candidates be promoted.
+
+Value is **density** — upload/day per byte of SSD occupied — not absolute rate.
+The cache is size-constrained, so what should be maximised is upload served per
+GB of cache. A 60 GB filmography uploading 30 GB/day (density 0.5) is a worse
+occupant than a 2 GB release uploading 5 GB/day (density 2.5): caching the pack
+would evict several of the small releases and serve *less* from the SSD. Ranking
+by density also maximises the chance that one of qB's few active-upload slots is
+served from the SSD rather than the HDD.
+
+Guards against thrashing:
+
+- **Hysteresis:** a hot torrent `H` is evicted only for a cold candidate `C`
+  with `density(C) ≥ density(H) × displacement_factor` (default 2.0).
+- **Time gates:** victims must have been hot ≥ `min_hot_minutes`; promoted
+  torrents must have been cold ≥ `min_cold_minutes`. A just-evicted torrent
+  cannot return until it ages back through the cold gate.
+- **Never evict for nothing:** evictions are committed only once they actually
+  let a candidate fit. A target too large to free room for (within
+  `max_displacements_per_tick` evictions) is skipped, and the next, smaller
+  candidate is tried instead — so a giant filmography can't stall the rebalance
+  or cost evictions that buy no promotion.
+
 ## Multi-qB
 
 When two qB instances share the same content (e.g. one VPN, one direct), the `torrents/<release>/<file>` paths are *different* (different download dirs), but the symlink targets (bulk file or SSD copy) can be **the same**. Tier state is tracked **per-infohash** (not per `(instance, infohash)`), so a single SSD copy can back multiple symlinks across instances. Disk accounting is by infohash, so the same content in two qB instances does not double-count against the quota. When the mover promotes a hot torrent, every instance that holds the same infohash gets its symlink retargeted in lockstep.
