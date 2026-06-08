@@ -35,14 +35,13 @@ the DB row, so a *future* DB loss is covered.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import structlog
 
 from . import recovery
 from .config import Config
+from .mover import retarget_to_bulk
 from .state import StateStore
-from .symlinks import atomic_retarget, relative_target
 
 log = structlog.get_logger(__name__)
 
@@ -66,28 +65,6 @@ def _rebuild_from_sidecar(
         ssd_bytes=meta.ssd_bytes,
         bulk_targets=meta.bulk_targets,
     )
-
-
-def _retarget_to_bulk(infohash: str, bulk_targets: dict[str, str], *, dry_run: bool) -> int:
-    """Point each link back at its relative bulk target. Returns links fixed."""
-    fixed = 0
-    for link_str, bulk_str in bulk_targets.items():
-        link = Path(link_str)
-        if not link.is_symlink():
-            # Real file or gone — nothing safe to do.
-            continue
-        rel = relative_target(link.parent, Path(bulk_str))
-        log.info(
-            "reconcile.retarget_to_bulk",
-            infohash=infohash,
-            link=link_str,
-            bulk=bulk_str,
-            dry_run=dry_run,
-        )
-        if not dry_run:
-            atomic_retarget(link, rel)
-        fixed += 1
-    return fixed
 
 
 def reconcile(config: Config, store: StateStore) -> ReconcileReport:
@@ -164,7 +141,7 @@ def reconcile(config: Config, store: StateStore) -> ReconcileReport:
             report.dropped += 1
             continue
         log.warning("reconcile.demote_missing_ssd", infohash=infohash, ssd_dir=str(ssd_dir))
-        _retarget_to_bulk(infohash, tier.bulk_targets, dry_run=dry_run)
+        retarget_to_bulk(infohash, tier.bulk_targets, dry_run=dry_run)
         if not dry_run:
             store.delete_tier(infohash=infohash)
         report.redemoted += 1

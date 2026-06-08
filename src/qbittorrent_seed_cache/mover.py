@@ -85,6 +85,36 @@ def bulk_targets_of(layouts: Iterable[TorrentLayout]) -> dict[str, str]:
     return {str(layout.link): str(layout.bulk_target) for layout in layouts}
 
 
+def retarget_to_bulk(
+    infohash: str, bulk_targets: dict[str, str], *, dry_run: bool = False
+) -> int:
+    """Point each link in ``bulk_targets`` back at its relative bulk file.
+
+    A "demote with nothing to copy": used when we must drop an SSD copy but
+    only have the persisted ``{link: bulk}`` mapping (a DB tier row or an
+    on-disk sidecar), not live qB layouts. Returns the number of links
+    retargeted. Links that are no longer symlinks (replaced by a real file,
+    or already gone) are skipped — there is nothing safe to do with them.
+    """
+    fixed = 0
+    for link_str, bulk_str in bulk_targets.items():
+        link = Path(link_str)
+        if not link.is_symlink():
+            continue
+        rel = relative_target(link.parent, Path(bulk_str))
+        log.info(
+            "retarget_to_bulk",
+            infohash=infohash,
+            link=link_str,
+            bulk=bulk_str,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            atomic_retarget(link, rel)
+        fixed += 1
+    return fixed
+
+
 def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False) -> int:
     """Promote a logical torrent to the SSD. Returns bytes copied (sum of unique destinations).
 

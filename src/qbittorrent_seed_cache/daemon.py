@@ -14,7 +14,11 @@ Per-tick flow:
   5. Bootstrap tier rows for previously-unknown infohashes from the
      current symlink state (is_hot_on_ssd).
   6. Cleanup orphans: infohashes with tier='hot' that no longer exist in
-     any instance (probably removed from qB) — rm their SSD dir, drop tier.
+     any instance (probably removed from qB) — retarget their symlinks back
+     to bulk (from the DB row / sidecar) first, then rm the SSD dir and drop
+     the tier row. Retargeting before the rm means a *wrong* reclaim (e.g. a
+     torrent only briefly absent during qB fastresume loading) degrades to a
+     cache miss instead of dangling links + a lost mapping (issue #5).
   7. Apply demotions first (frees SSD bytes).
   7b. Reclaim SSD dirs that are neither hot nor referenced by a live symlink,
      and (re)evaluate the anomaly marker from the live view. Steps 6 and 7b
@@ -48,7 +52,7 @@ from . import recovery
 from .config import Config, InstanceConfig
 from .hotness import HotnessScore
 from .hotness import score as score_history
-from .mover import bulk_targets_of, demote, promote
+from .mover import bulk_targets_of, demote, promote, retarget_to_bulk
 from .qbit_client import QbitClient
 from .reconcile import reconcile_startup
 from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, references_ssd, resolve
@@ -204,17 +208,52 @@ def _bootstrap_tier(
         )
 
 
+def _bulk_targets_for(config: Config, store: StateStore, infohash: str) -> dict[str, str]:
+    """Best-effort ``{link: bulk}`` map for a torrent about to lose its SSD copy.
+
+    Prefers the DB tier row and falls back to the on-disk sidecar so we can
+    retarget the symlinks back to bulk before reclaiming the dir, even when
+    one of the two persisted copies is already missing. Returns ``{}`` when
+    neither source has a usable mapping.
+    """
+    tier = store.get_tier(infohash=infohash)
+    if tier is not None and tier.bulk_targets:
+        return tier.bulk_targets
+    meta = recovery.read_meta(config.ssd_cache_dir, infohash)
+    if meta is not None:
+        return meta.bulk_targets
+    return {}
+
+
 def _cleanup_orphans(
     live_infohashes: set[str], config: Config, store: StateStore
 ) -> int:
-    """Drop SSD content + tier row for hot infohashes no longer in any qB instance."""
+    """Drop SSD content + tier row for hot infohashes no longer in any qB instance.
+
+    Before removing the SSD copy we retarget the torrent's symlinks back to
+    bulk (from the DB row, falling back to the sidecar). If the torrent was
+    only *temporarily* absent — e.g. qB answered the poll while still loading
+    fastresume and returned a partial list — this reclaim is wrong, but with
+    the links already pointing at the canonical bulk files the worst case
+    degrades to a cache miss instead of dangling links plus a lost mapping
+    (issue #5).
+    """
     freed_count = 0
     for ih in store.hot_infohashes():
         if ih in live_infohashes:
             continue
         ssd_dir = config.ssd_cache_dir / ih
-        log.info("orphan.cleanup", infohash=ih, ssd_dir=str(ssd_dir), dry_run=config.dry_run)
+        bulk_targets = _bulk_targets_for(config, store, ih)
+        log.info(
+            "orphan.cleanup",
+            infohash=ih,
+            ssd_dir=str(ssd_dir),
+            retargetable_links=len(bulk_targets),
+            dry_run=config.dry_run,
+        )
         if not config.dry_run:
+            if bulk_targets:
+                retarget_to_bulk(ih, bulk_targets, dry_run=False)
             remove_tree(ssd_dir)
             store.delete_tier(infohash=ih)
         freed_count += 1
@@ -239,14 +278,24 @@ def _cleanup_fs_orphans(
     for infohash, ssd_dir in recovery.iter_ssd_infohash_dirs(config.ssd_cache_dir):
         if infohash in in_use:
             continue
+        # If a sidecar survived, retarget any of its links back to bulk before
+        # the rm. The dir is unreferenced by any *live* symlink, so this is a
+        # no-op for healthy state; it only matters for a link left dangling
+        # into this dir (e.g. a sibling reclaim that lost the DB row first),
+        # which it heals instead of leaving broken. See issue #5.
+        meta = recovery.read_meta(config.ssd_cache_dir, infohash)
+        bulk_targets = meta.bulk_targets if meta is not None else {}
         log.info(
             "orphan.fs_reclaim",
             infohash=infohash,
             ssd_dir=str(ssd_dir),
             payload=recovery.ssd_dir_has_payload(ssd_dir),
+            retargetable_links=len(bulk_targets),
             dry_run=config.dry_run,
         )
         if not config.dry_run:
+            if bulk_targets:
+                retarget_to_bulk(infohash, bulk_targets, dry_run=False)
             remove_tree(ssd_dir)
         reclaimed += 1
     return reclaimed
