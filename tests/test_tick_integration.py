@@ -526,3 +526,70 @@ async def test_tick_flags_then_clears_anomaly_for_unmapped_live_symlink(
         assert recovery.has_anomaly(ssd) is False
     finally:
         store.close()
+
+
+async def test_orphan_cleanup_retargets_to_bulk_before_rm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #5: a hot torrent that vanishes from a (transport-successful but
+    semantically partial) poll is orphan-cleaned. The reclaim must first
+    retarget its symlinks back to the canonical bulk file, so the worst case
+    is a cache miss — NOT a dangling link plus a lost mapping."""
+    bulk_root, ssd = make_dirs(tmp_path)
+
+    save_qb = bulk_root / "storage" / "torrents" / "rel-Vanish"
+    ti, files = make_torrent(
+        bulk_root=bulk_root,
+        save_subdir_host=save_qb,
+        save_path_qb="/data/torrents/rel-Vanish",
+        rel_files=[("video.mkv", b"x" * 200)],
+        infohash="HASHVANISH",
+        uploaded_session=400 * 1024 * 1024,
+    )
+    bulk_file = bulk_root / "storage" / "Films" / "HASHVANISH" / "video.mkv"
+    link = save_qb / "video.mkv"
+
+    data = {"qb1": {"torrents": [ti], "files": {"HASHVANISH": files}}}
+    monkeypatch.setattr(
+        "qbittorrent_seed_cache.daemon.QbitClient", make_fake_client(data)
+    )
+    config = make_config(
+        tmp_path, bulk_root=bulk_root, ssd=ssd, instance_names=["qb1"],
+        promote_min_mb=50,
+    )
+
+    store = StateStore(config.state_db)
+    try:
+        day_ago = int(time.time()) - 86_400
+        store.record(instance="qb1", infohash="HASHVANISH", ts=day_ago,
+                     uploaded_session=0, upspeed=0)
+        store.set_tier(infohash="HASHVANISH", tier="cold",
+                       since_ts=day_ago, ssd_bytes=0)
+
+        # Tick 1: promote. Link now points into the SSD.
+        await _tick(config, store)
+        ssd_file = ssd / "HASHVANISH" / "video.mkv"
+        assert ssd_file.is_file()
+        assert Path(os.readlink(link)) == ssd_file
+
+        # Tick 2: qB has restarted and answers with a PARTIAL list that omits
+        # this torrent (poll succeeds → poll_ok stays True → orphan cleanup
+        # fires). Before the fix this left the link dangling into a deleted
+        # SSD path with both copies of the mapping gone.
+        empty: dict[str, dict[str, Any]] = {"qb1": {"torrents": [], "files": {}}}
+        monkeypatch.setattr(
+            "qbittorrent_seed_cache.daemon.QbitClient", make_fake_client(empty)
+        )
+        await _tick(config, store)
+
+        # SSD reclaimed and tier dropped (the reclaim still happens)...
+        assert not (ssd / "HASHVANISH").exists()
+        assert store.get_tier(infohash="HASHVANISH") is None
+        # ...but the symlink was retargeted to bulk first: it still resolves,
+        # to the canonical file, and is not dangling.
+        assert link.is_symlink()
+        assert not Path(os.readlink(link)).is_absolute()  # relative → bulk
+        assert link.resolve() == bulk_file.resolve()
+        assert link.read_bytes() == b"x" * 200
+    finally:
+        store.close()
