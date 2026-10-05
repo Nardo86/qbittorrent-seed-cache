@@ -19,7 +19,9 @@ Per-tick flow:
      the tier row. Retargeting before the rm means a *wrong* reclaim (e.g. a
      torrent only briefly absent during qB fastresume loading) degrades to a
      cache miss instead of dangling links + a lost mapping (issue #5).
-  7. Apply demotions first (frees SSD bytes).
+  7. Apply demotions first (frees SSD bytes). Demotions and displacements
+     are skipped when an instance poll failed: the scores would miss that
+     instance's upload and its symlinks would be missing from the layouts.
   6b. Find live symlinks into the SSD whose link->bulk mapping is lost
      (anomaly). Their torrents are quarantined for the rest of the tick
      (never promoted, demoted or displaced) and the anomaly marker + a
@@ -261,6 +263,15 @@ def _bulk_targets_for(config: Config, store: StateStore, infohash: str) -> dict[
     return {}
 
 
+def _demote_logical(config: Config, store: StateStore, lt: LogicalTorrent) -> int:
+    """Demote ``lt``, also retargeting persisted links its live layouts miss."""
+    return demote(
+        lt.layouts,
+        dry_run=config.dry_run,
+        extra_bulk_targets=_bulk_targets_for(config, store, lt.infohash),
+    )
+
+
 def _cleanup_orphans(
     live_infohashes: set[str], config: Config, store: StateStore
 ) -> int:
@@ -447,17 +458,23 @@ async def _tick(
         else 0
     )
 
-    # 7. Demote first.
-    demotions = select_demotions(
-        active,
-        now_ts=now,
-        demote_max_mb=config.hotness.demote_max_upload_mb,
-        min_hot_minutes=config.hotness.min_hot_minutes,
+    # 7. Demote first — only with a complete poll. With an instance down,
+    #    its torrents' scores lose that instance's upload (spurious
+    #    demotions) and its symlinks are missing from the live layouts.
+    demotions = (
+        select_demotions(
+            active,
+            now_ts=now,
+            demote_max_mb=config.hotness.demote_max_upload_mb,
+            min_hot_minutes=config.hotness.min_hot_minutes,
+        )
+        if poll_ok
+        else []
     )
     for c in demotions:
         lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(demote, lt.layouts, dry_run=config.dry_run)
+            await asyncio.to_thread(_demote_logical, config, store, lt)
         except Exception:
             log.exception("demote.failed", infohash=c.infohash)
             continue
@@ -476,7 +493,7 @@ async def _tick(
         if reclaimed:
             log.info("tick.fs_orphans_reclaimed", count=reclaimed)
     else:
-        log.warning("tick.skip_orphan_reclaim_poll_incomplete")
+        log.warning("tick.skip_demote_and_reclaim_poll_incomplete")
 
     # 8. Recompute headroom.
     available = await asyncio.to_thread(
@@ -502,22 +519,24 @@ async def _tick(
     #     for denser cold candidates (density = upload/day per byte; a candidate
     #     must beat its victim's density by displacement_factor). Eviction frees
     #     SSD without an HDD read; the promote step below fills the headroom.
-    displacements = select_displacements(
-        active,
-        now_ts=now,
-        available_bytes=available,
-        promote_min_mb=config.hotness.promote_min_upload_mb,
-        min_hot_minutes=config.hotness.min_hot_minutes,
-        min_cold_minutes=config.hotness.min_cold_minutes,
-        displacement_factor=config.hotness.displacement_factor,
-        max_promotions=config.max_concurrent_promotions,
-        max_evictions=config.max_displacements_per_tick,
-        max_size_bytes=max_size_bytes,
-    )
+    displacements: list[TorrentCandidate] = []
+    if poll_ok:
+        displacements = select_displacements(
+            active,
+            now_ts=now,
+            available_bytes=available,
+            promote_min_mb=config.hotness.promote_min_upload_mb,
+            min_hot_minutes=config.hotness.min_hot_minutes,
+            min_cold_minutes=config.hotness.min_cold_minutes,
+            displacement_factor=config.hotness.displacement_factor,
+            max_promotions=config.max_concurrent_promotions,
+            max_evictions=config.max_displacements_per_tick,
+            max_size_bytes=max_size_bytes,
+        )
     for c in displacements:
         lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(demote, lt.layouts, dry_run=config.dry_run)
+            await asyncio.to_thread(_demote_logical, config, store, lt)
         except Exception:
             log.exception("displace.failed", infohash=c.infohash)
             continue

@@ -20,7 +20,9 @@ state from which the filesystem alone can be reconciled (see
 
 Hot → Cold (`demote`):
   1. Retarget every layout's symlink to a relative path into the bulk
-     filesystem.
+     filesystem — plus any *persisted* link (DB row / sidecar) that the
+     live layouts do not cover but that still points into this SSD dir
+     (e.g. a link of a qB instance whose poll failed this tick).
   2. Remove the SSD `<infohash>/` directory once (this also removes the
      sidecar that lives inside it).
 
@@ -29,6 +31,7 @@ Both helpers expect every layout in the list to share the same infohash.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +77,14 @@ def _ssd_root(layout: TorrentLayout) -> Path:
     raise ValueError(
         f"ssd_target {layout.ssd_target} does not contain infohash dir {layout.infohash!r}"
     )
+
+
+def _resolves_under(link: Path, root: Path) -> bool:
+    try:
+        Path(os.path.realpath(link)).relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def bulk_targets_of(layouts: Iterable[TorrentLayout]) -> dict[str, str]:
@@ -193,8 +204,20 @@ def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False)
     return total
 
 
-def demote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
-    """Demote a logical torrent: retarget all symlinks to bulk, drop SSD copy."""
+def demote(
+    layouts: list[TorrentLayout],
+    *,
+    dry_run: bool = False,
+    extra_bulk_targets: dict[str, str] | None = None,
+) -> int:
+    """Demote a logical torrent: retarget all symlinks to bulk, drop SSD copy.
+
+    ``extra_bulk_targets`` is the persisted ``{link: bulk}`` map of the
+    torrent. Links in it that are not among ``layouts`` but still resolve
+    into this torrent's SSD dir are retargeted too before the ``rm``:
+    otherwise removing the dir would leave them dangling with their mapping
+    gone (the tier row is reset to cold right after).
+    """
     if not layouts:
         return 0
     infohash = _check_single_infohash(layouts)
@@ -223,6 +246,23 @@ def demote(layouts: list[TorrentLayout], *, dry_run: bool = False) -> int:
             atomic_retarget(layout.link, rel)
 
     ssd_root = _ssd_root(layouts[0])
+    covered = {str(layout.link) for layout in layouts}
+    for link_str, bulk_str in (extra_bulk_targets or {}).items():
+        link = Path(link_str)
+        if link_str in covered or not link.is_symlink():
+            continue
+        if not _resolves_under(link, ssd_root):
+            continue
+        log.info(
+            "demote.retarget_extra",
+            infohash=infohash,
+            link=link_str,
+            bulk=bulk_str,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            atomic_retarget(link, relative_target(link.parent, Path(bulk_str)))
+
     log.info("demote.rm_ssd", infohash=infohash, ssd_root=str(ssd_root), bytes=freed, dry_run=dry_run)
     if not dry_run:
         remove_tree(ssd_root)
