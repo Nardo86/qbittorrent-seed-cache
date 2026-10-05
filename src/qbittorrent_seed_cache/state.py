@@ -14,13 +14,20 @@ classified as gone-from-qB and orphan-cleaned. See resolver.resolve().
 uploaded_session resets when qB restarts. We detect resets (current < previous)
 and treat the new value as the delta from zero. The rolling-window score
 is computed in hotness.py from the deltas between consecutive snapshots.
+
+Size: one row per (instance, torrent) per poll adds up — with a 60 s poll,
+~400 torrents and a 14-day window that is ~8M rows (≈1-2 GB). Rows older than
+the window are pruned every tick; on top of that `compact_snapshots` thins
+rows older than a day to one per bucket in a way that leaves the hotness
+sums unchanged, and `vacuum_if_fragmented` gives the space freed by pruning
+back to the filesystem (SQLite never shrinks the file on its own).
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +41,6 @@ CREATE TABLE IF NOT EXISTS snapshots (
     upspeed          INTEGER NOT NULL,
     PRIMARY KEY (instance, infohash, ts)
 );
-
-CREATE INDEX IF NOT EXISTS idx_snapshots_recent
-    ON snapshots (instance, infohash, ts DESC);
 
 CREATE TABLE IF NOT EXISTS tier (
     infohash      TEXT    NOT NULL PRIMARY KEY,
@@ -77,6 +81,9 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
         self._migrate_bulk_targets()
+        # Redundant with the primary key's index (same columns; SQLite scans
+        # it in either direction) — it only doubled the snapshot footprint.
+        self._conn.execute("DROP INDEX IF EXISTS idx_snapshots_recent")
 
     def _migrate_bulk_targets(self) -> None:
         """Add tier.bulk_targets to pre-existing DBs that didn't have it."""
@@ -122,6 +129,73 @@ class StateStore:
     def prune(self, *, before_ts: int) -> int:
         cur = self._conn.execute("DELETE FROM snapshots WHERE ts < ?", (before_ts,))
         return cur.rowcount or 0
+
+    def compact_snapshots(self, *, before_ts: int, bucket_seconds: int) -> int:
+        """Thin snapshots older than ``before_ts`` to ~one per ``bucket_seconds``.
+
+        The hotness score only sums positive deltas of ``uploaded_session``
+        (with a qB restart, i.e. a value lower than the previous one, counting
+        the new value from zero). Inside a run without restarts the counter is
+        non-decreasing and the deltas telescope, so interior rows can go
+        without changing the sum. We keep, per (instance, infohash) series:
+
+        * the first row and the last old row;
+        * the last row of every time bucket (resolution of the thinned part);
+        * both rows around every restart (``next < current``).
+
+        Every removed row then lies strictly inside a non-decreasing run, so
+        the summed upload over any range of kept rows is exactly what it was.
+        (Only a window boundary falling inside a thinned stretch is affected,
+        by at most one bucket out of the whole window.)
+
+        Works series by series to keep memory bounded. Returns rows deleted.
+        """
+        series = self._conn.execute(
+            "SELECT DISTINCT instance, infohash FROM snapshots WHERE ts < ?", (before_ts,)
+        ).fetchall()
+        deleted = 0
+        for instance, infohash in series:
+            rows = self._conn.execute(
+                """
+                SELECT ts, uploaded_session FROM snapshots
+                 WHERE instance = ? AND infohash = ? AND ts < ?
+                 ORDER BY ts ASC
+                """,
+                (instance, infohash, before_ts),
+            ).fetchall()
+            drop = _thin(rows, bucket_seconds)
+            if not drop:
+                continue
+            with self._tx() as conn:
+                conn.executemany(
+                    "DELETE FROM snapshots WHERE instance = ? AND infohash = ? AND ts = ?",
+                    [(instance, infohash, ts) for ts in drop],
+                )
+            deleted += len(drop)
+        return deleted
+
+    def file_stats(self) -> tuple[int, int]:
+        """``(file bytes, free-page bytes)`` of the main database file."""
+        page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+        free = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        return pages * page_size, free * page_size
+
+    def vacuum_if_fragmented(
+        self, *, min_free_ratio: float = 0.5, min_free_bytes: int = 32 * 1024 * 1024
+    ) -> bool:
+        """VACUUM when most of the file is free pages (e.g. after pruning).
+
+        Deleting rows only moves pages to SQLite's freelist; the file never
+        shrinks. Rewriting it costs about the size of the *live* data, so this
+        is cheap exactly when it is worth doing. Returns True if it ran.
+        """
+        size, free = self.file_stats()
+        if free < min_free_bytes or free < size * min_free_ratio:
+            return False
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return True
 
     def get_tier(self, *, infohash: str) -> TierRow | None:
         row = self._conn.execute(
@@ -177,3 +251,23 @@ class StateStore:
             "SELECT COALESCE(SUM(ssd_bytes), 0) FROM tier WHERE tier = 'hot'"
         ).fetchone()
         return int(row[0])
+
+
+def _thin(rows: Sequence[tuple[int, int]], bucket_seconds: int) -> list[int]:
+    """Timestamps of the rows of one series that `compact_snapshots` may drop.
+
+    ``rows`` are ``(ts, uploaded_session)`` sorted by ts.
+    """
+    n = len(rows)
+    if n <= 2:
+        return []
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    for i in range(n - 1):
+        ts, up = rows[i]
+        nts, nup = rows[i + 1]
+        if nup < up:  # counter reset between i and i+1: keep both sides
+            keep[i] = keep[i + 1] = True
+        if nts // bucket_seconds != ts // bucket_seconds:  # last row of its bucket
+            keep[i] = True
+    return [rows[i][0] for i in range(n) if not keep[i]]

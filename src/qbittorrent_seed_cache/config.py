@@ -63,6 +63,11 @@ class Config(BaseModel):
 
     poll_interval_sec: int = Field(300, gt=0)
     state_db: Path = Path("/var/lib/seed-cache/state.db")
+    # Snapshots older than this keep only one row per `snapshot_bucket_minutes`
+    # (plus the rows around qB restarts), which leaves the hotness sums
+    # unchanged while cutting the DB ~10x at a 60 s poll. 0 disables thinning.
+    snapshot_full_resolution_hours: int = Field(24, ge=0)
+    snapshot_bucket_minutes: int = Field(60, gt=0)
 
     log_format: Literal["json", "console"] = "json"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

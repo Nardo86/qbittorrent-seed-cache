@@ -10,7 +10,8 @@ Per-tick flow:
      infohash. The SSD copy is shared across instances; symlinks in each
      instance are retargeted in lockstep.
   4. Score hotness per (instance, infohash) and sum into a per-infohash
-     score. The `instances` list on each candidate is informational.
+     score. (Old snapshots are pruned every tick; hourly, rows older than a
+     day are thinned and the DB file vacuumed when mostly free pages.) The `instances` list on each candidate is informational.
   5. Bootstrap tier rows for previously-unknown infohashes from the
      current symlink state (is_hot_on_ssd).
   6. Cleanup orphans: infohashes with tier='hot' that no longer exist in
@@ -85,6 +86,8 @@ log = structlog.get_logger(__name__)
 PROMOTION_RESUME_TTL_SEC = 24 * 3600
 _PROGRESS_BEAT_SEC = 30
 _PROGRESS_LOG_SEC = 60
+# DB thinning + VACUUM check cadence.
+DB_MAINTENANCE_INTERVAL_SEC = 3600
 
 
 @dataclass
@@ -98,6 +101,7 @@ class DaemonRuntime:
     # event loop cannot cancel; they poll this between chunks so shutdown
     # completes within Docker's stop timeout and keeps the partial file.
     halt: threading.Event = field(default_factory=threading.Event)
+    last_db_maintenance_ts: int = 0
 
     @classmethod
     def for_config(cls, config: Config) -> DaemonRuntime:
@@ -114,6 +118,28 @@ def _heartbeat(config: Config, now_ts: int) -> None:
     recovery.write_heartbeat(
         config.ssd_cache_dir, now_ts=now_ts, stale_after_ts=now_ts + grace
     )
+
+
+def _maintain_db(config: Config, store: StateStore, now_ts: int) -> None:
+    """Thin old snapshots and give freed pages back to the filesystem."""
+    compacted = 0
+    if config.snapshot_full_resolution_hours > 0:
+        compacted = store.compact_snapshots(
+            before_ts=now_ts - config.snapshot_full_resolution_hours * 3600,
+            bucket_seconds=config.snapshot_bucket_minutes * 60,
+        )
+    size_before, free_before = store.file_stats()
+    vacuumed = store.vacuum_if_fragmented()
+    size_after, _ = store.file_stats()
+    if compacted or vacuumed:
+        log.info(
+            "db.maintenance",
+            compacted_rows=compacted,
+            vacuumed=vacuumed,
+            size_before=size_before,
+            free_before=free_before,
+            size_after=size_after,
+        )
 
 
 def _copy_progress(config: Config, infohash: str) -> Callable[[int, int], None]:
@@ -482,6 +508,12 @@ async def _tick(
     pruned = await asyncio.to_thread(store.prune, before_ts=now - window_seconds)
     if pruned:
         log.info("tick.pruned", rows=pruned)
+    if now - rt.last_db_maintenance_ts >= DB_MAINTENANCE_INTERVAL_SEC:
+        rt.last_db_maintenance_ts = now
+        try:
+            await asyncio.to_thread(_maintain_db, config, store, now)
+        except Exception:
+            log.exception("db.maintenance_failed")
 
     # 5. Build per-infohash candidates + bootstrap unknown tiers.
     candidates = _build_candidates(
