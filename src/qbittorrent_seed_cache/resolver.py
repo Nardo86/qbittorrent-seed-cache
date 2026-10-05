@@ -180,12 +180,14 @@ def resolve(
             bulk_target_str = (hot_bulk_map or {}).get(str(link))
             if bulk_target_str is None:
                 # The symlink points into the SSD but neither the DB nor a
-                # reconciled sidecar told us its bulk origin. Startup
-                # reconciliation normally rebuilds this mapping, so reaching
-                # here at steady state means the torrent's accounting is lost
-                # — log loudly (this is the silent footgun that once filled
-                # the disk) rather than skipping quietly.
-                log.error(
+                # reconciled sidecar told us its bulk origin: the torrent's
+                # link->bulk mapping is lost. This is NOT logged loudly here —
+                # it would repeat for every file on every tick (over a
+                # million lines a month in production). The daemon detects the
+                # same links from `ssd_links()`, quarantines the torrent, sets
+                # the anomaly marker and reports it once per change (see
+                # `anomaly.py`).
+                log.debug(
                     "resolve.skip_file_hot_unknown_bulk",
                     instance=instance,
                     infohash=torrent.hash,
@@ -243,6 +245,30 @@ def resolve(
     )
 
 
+def ssd_links(
+    *,
+    torrent: TorrentInfo,
+    files: list[dict[str, Any]],
+    ssd_cache_dir: Path,
+    path_map: dict[str, str],
+) -> list[Path]:
+    """The torrent's file symlinks that currently resolve into the SSD cache.
+
+    Independent of whether the bulk origin can be recovered — it only asks
+    "which live symlinks point into the cache?" (dangling ones included). The
+    tick uses this to decide which `<ssd_cache_dir>/<infohash>/` dirs are
+    still referenced and must not be reclaimed as orphans, and to detect
+    symlinks into the SSD whose mapping is lost (an unrecoverable anomaly).
+    """
+    save_path_host = map_to_host(torrent.save_path, path_map)
+    out: list[Path] = []
+    for f in files:
+        link = save_path_host / f["name"]
+        if link.is_symlink() and _is_under(Path(os.path.realpath(link)), ssd_cache_dir):
+            out.append(link)
+    return out
+
+
 def references_ssd(
     *,
     torrent: TorrentInfo,
@@ -250,20 +276,15 @@ def references_ssd(
     ssd_cache_dir: Path,
     path_map: dict[str, str],
 ) -> bool:
-    """True if any of the torrent's file symlinks currently resolve into the SSD.
+    """True if any of the torrent's file symlinks currently resolve into the SSD."""
+    return bool(
+        ssd_links(torrent=torrent, files=files, ssd_cache_dir=ssd_cache_dir, path_map=path_map)
+    )
 
-    Independent of whether the bulk origin can be recovered — it only asks
-    "does a live symlink point into the cache?". The tick uses this to decide
-    which `<ssd_cache_dir>/<infohash>/` dirs are still referenced and must not
-    be reclaimed as orphans, and to detect symlinks into the SSD whose mapping
-    is lost (an unrecoverable anomaly).
-    """
-    save_path_host = map_to_host(torrent.save_path, path_map)
-    for f in files:
-        link = save_path_host / f["name"]
-        if link.is_symlink() and _is_under(Path(os.path.realpath(link)), ssd_cache_dir):
-            return True
-    return False
+
+def is_under(p: Path, root: Path) -> bool:
+    """True if ``p`` is ``root`` or lies below it (purely lexical)."""
+    return _is_under(p, root)
 
 
 def _is_under(p: Path, root: Path) -> bool:

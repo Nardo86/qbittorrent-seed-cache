@@ -32,12 +32,19 @@ the sidecars at startup.
 
 Anomaly marker
 --------------
-When reconciliation finds state it cannot repair automatically (an SSD
-directory with no sidecar and no DB row, or a DB hot row with no
-``bulk_targets`` and a missing SSD dir), it drops an anomaly marker file in
-the SSD cache dir. The container healthcheck reports unhealthy while the
-marker is present, turning a silent data-integrity problem into a visible
-one that an operator can act on.
+When the tick finds a live symlink that resolves into the SSD but whose
+``link -> bulk`` mapping is in neither the DB nor a sidecar, it drops an
+anomaly marker file in the SSD cache dir (see
+:mod:`qbittorrent_seed_cache.anomaly`). The marker lists the affected links
+and is surfaced by the healthcheck output, turning a silent data-integrity
+problem into a visible one that an operator can act on (``repair-dangling``).
+
+Heartbeat
+---------
+The daemon refreshes ``.qbsc-heartbeat`` at every tick and while a long
+promotion copy is in progress. The healthcheck uses it as a *liveness*
+signal: a stale heartbeat means the daemon is hung, which a restart can fix
+(unlike a data anomaly, which it cannot).
 """
 
 from __future__ import annotations
@@ -56,6 +63,11 @@ log = structlog.get_logger(__name__)
 META_NAME = ".qbsc-meta.json"
 META_SCHEMA_VERSION = 1
 ANOMALY_MARKER = ".qbsc-anomaly"
+HEARTBEAT_NAME = ".qbsc-heartbeat"
+
+# Bookkeeping files that live inside an ``<infohash>/`` dir but are not
+# cached payload.
+_INTERNAL_NAMES = frozenset({META_NAME})
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +83,23 @@ class SidecarMeta:
 def meta_path(ssd_cache_dir: Path, infohash: str) -> Path:
     """Path of the sidecar for ``infohash`` under ``ssd_cache_dir``."""
     return ssd_cache_dir / infohash / META_NAME
+
+
+def _atomic_write_json(dest: Path, payload: object, *, fsync: bool) -> None:
+    """Write ``payload`` as JSON to ``dest`` via a sibling tmp file + rename."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{dest.name}.", dir=str(dest.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            if fsync:
+                os.fsync(fh.fileno())
+        os.replace(tmp, dest)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 def write_meta(
@@ -95,18 +124,7 @@ def write_meta(
         "ssd_bytes": ssd_bytes,
         "bulk_targets": bulk_targets,
     }
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{META_NAME}.", dir=str(dest.parent))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, dest)
-    except BaseException:
-        if tmp.exists():
-            tmp.unlink()
-        raise
+    _atomic_write_json(dest, payload, fsync=True)
 
 
 def read_meta(ssd_cache_dir: Path, infohash: str) -> SidecarMeta | None:
@@ -175,7 +193,7 @@ def ssd_dir_has_payload(ssd_dir: Path) -> bool:
         return False
     for root, _dirs, files in os.walk(ssd_dir):
         for name in files:
-            if name == META_NAME:
+            if name in _INTERNAL_NAMES:
                 continue
             full = Path(root) / name
             try:
@@ -193,7 +211,7 @@ def ssd_dir_bytes(ssd_dir: Path) -> int:
         return 0
     for root, _dirs, files in os.walk(ssd_dir):
         for name in files:
-            if name == META_NAME:
+            if name in _INTERNAL_NAMES:
                 continue
             try:
                 total += (Path(root) / name).stat().st_size
@@ -203,7 +221,7 @@ def ssd_dir_bytes(ssd_dir: Path) -> int:
 
 
 def set_anomaly(ssd_cache_dir: Path, detail: str) -> None:
-    """Create/refresh the anomaly marker so the healthcheck reports unhealthy."""
+    """Create/refresh the anomaly marker (reported by the healthcheck)."""
     marker = ssd_cache_dir / ANOMALY_MARKER
     try:
         marker.write_text(detail, encoding="utf-8")
@@ -222,3 +240,48 @@ def clear_anomaly(ssd_cache_dir: Path) -> None:
 
 def has_anomaly(ssd_cache_dir: Path) -> bool:
     return (ssd_cache_dir / ANOMALY_MARKER).exists()
+
+
+def read_anomaly(ssd_cache_dir: Path) -> str | None:
+    """Return the anomaly marker's text, or ``None`` if there is no marker."""
+    marker = ssd_cache_dir / ANOMALY_MARKER
+    try:
+        return marker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"(anomaly marker unreadable: {exc})"
+
+
+# --- heartbeat --------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Heartbeat:
+    ts: int
+    stale_after_ts: int
+
+
+def write_heartbeat(ssd_cache_dir: Path, *, now_ts: int, stale_after_ts: int) -> None:
+    """Record that the daemon is alive and when that claim expires.
+
+    The daemon decides the deadline (it knows its poll interval); the
+    healthcheck only compares it with the clock. Best effort: a failure is
+    logged, never raised — a missed beat must not break a tick.
+    """
+    payload = {"ts": now_ts, "stale_after_ts": stale_after_ts, "pid": os.getpid()}
+    try:
+        _atomic_write_json(ssd_cache_dir / HEARTBEAT_NAME, payload, fsync=False)
+    except OSError as exc:
+        log.warning("recovery.heartbeat_write_failed", error=str(exc))
+
+
+def read_heartbeat(ssd_cache_dir: Path) -> Heartbeat | None:
+    """Return the last heartbeat, or ``None`` if absent or unreadable."""
+    try:
+        with (ssd_cache_dir / HEARTBEAT_NAME).open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return Heartbeat(ts=int(data["ts"]), stale_after_ts=int(data["stale_after_ts"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+

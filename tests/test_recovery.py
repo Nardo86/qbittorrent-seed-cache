@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from qbittorrent_seed_cache import healthcheck, recovery
+from qbittorrent_seed_cache import recovery
 
 
 def test_write_then_read_meta_roundtrip(tmp_path: Path) -> None:
@@ -104,13 +104,14 @@ def test_anomaly_marker_set_clear(tmp_path: Path) -> None:
     assert recovery.has_anomaly(ssd) is False
 
 
-def test_healthcheck_unhealthy_when_anomaly(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_heartbeat_roundtrip_and_garbage(tmp_path: Path) -> None:
     ssd = tmp_path / "ssd"
     ssd.mkdir()
-    monkeypatch.setenv("QBSC_SSD_DIR", str(ssd))
-
-    assert healthcheck.main() == 0
-    recovery.set_anomaly(ssd, "ssd dir without sidecar or DB mapping: HASH")
-    assert healthcheck.main() == 1
-    recovery.clear_anomaly(ssd)
-    assert healthcheck.main() == 0
+    assert recovery.read_heartbeat(ssd) is None
+    recovery.write_heartbeat(ssd, now_ts=100, stale_after_ts=200)
+    hb = recovery.read_heartbeat(ssd)
+    assert hb == recovery.Heartbeat(ts=100, stale_after_ts=200)
+    (ssd / recovery.HEARTBEAT_NAME).write_text("{garbage", encoding="utf-8")
+    assert recovery.read_heartbeat(ssd) is None
+    # Not an infohash dir.
+    assert list(recovery.iter_ssd_infohash_dirs(ssd)) == []

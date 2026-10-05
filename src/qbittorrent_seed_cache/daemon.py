@@ -20,13 +20,20 @@ Per-tick flow:
      torrent only briefly absent during qB fastresume loading) degrades to a
      cache miss instead of dangling links + a lost mapping (issue #5).
   7. Apply demotions first (frees SSD bytes).
-  7b. Reclaim SSD dirs that are neither hot nor referenced by a live symlink,
-     and (re)evaluate the anomaly marker from the live view. Steps 6 and 7b
-     are skipped if any instance poll failed (the live set would be partial).
+  6b. Find live symlinks into the SSD whose link->bulk mapping is lost
+     (anomaly). Their torrents are quarantined for the rest of the tick
+     (never promoted, demoted or displaced) and the anomaly marker + a
+     rate-limited error line report them (see `anomaly`).
+  7b. Reclaim SSD dirs that are neither hot nor referenced by a live symlink.
+     Steps 6, 6b (marker update) and 7b are skipped if any instance poll
+     failed (the live set would be partial).
   8. Recompute available headroom.
   9. Apply promotions within headroom (greedy by hotness, capped by
      max_concurrent_promotions). On success, persist the bulk_targets
      map alongside the tier row.
+
+Liveness: a heartbeat file is refreshed at every tick; the healthcheck
+treats a stale heartbeat (not a data anomaly) as unhealthy.
 
 Crash recovery: tier rows survive restarts. If a transition is interrupted
 mid-way, the on-disk symlinks + SSD content are authoritative; the next
@@ -45,17 +52,19 @@ import contextlib
 import shutil
 import signal
 import time
+from dataclasses import dataclass, field
 
 import structlog
 
 from . import recovery
+from .anomaly import AnomalyReporter, find_unmapped_links
 from .config import Config, InstanceConfig
 from .hotness import HotnessScore
 from .hotness import score as score_history
 from .mover import bulk_targets_of, demote, promote, retarget_to_bulk
 from .qbit_client import QbitClient
 from .reconcile import reconcile_startup
-from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, references_ssd, resolve
+from .resolver import LogicalTorrent, ResolvedTorrent, aggregate, resolve, ssd_links
 from .selector import (
     TorrentCandidate,
     select_demotions,
@@ -68,20 +77,46 @@ from .symlinks import remove_tree
 log = structlog.get_logger(__name__)
 
 
+@dataclass
+class DaemonRuntime:
+    """State that outlives a single tick (one per daemon process)."""
+
+    anomaly: AnomalyReporter = field(
+        default_factory=lambda: AnomalyReporter(log_interval_sec=3600)
+    )
+
+    @classmethod
+    def for_config(cls, config: Config) -> DaemonRuntime:
+        return cls(anomaly=AnomalyReporter(log_interval_sec=config.anomaly_log_interval_sec))
+
+
+def _heartbeat(config: Config, now_ts: int) -> None:
+    """Refresh the liveness heartbeat read by the healthcheck.
+
+    The deadline leaves room for a few slow ticks (polling hundreds of
+    torrents, pruning a large window) on top of the poll interval.
+    """
+    grace = 3 * config.poll_interval_sec + 600
+    recovery.write_heartbeat(
+        config.ssd_cache_dir, now_ts=now_ts, stale_after_ts=now_ts + grace
+    )
+
+
 async def _collect_instance(
     instance: InstanceConfig,
     config: Config,
     hot_bulk_maps: dict[str, dict[str, str]],
-) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent], set[str]]:
+) -> tuple[list[tuple[str, int, int]], list[ResolvedTorrent], dict[str, set[str]]]:
     """Poll one qB instance.
 
     Returns:
       - snapshots: list of (infohash, uploaded_session, upspeed) tuples to record.
       - resolved: list of ResolvedTorrent for torrents that follow the symlink
         convention.
-      - ssd_referenced: infohashes whose live symlinks currently resolve into
-        the SSD cache (whether or not their bulk origin could be recovered).
-        Used to protect referenced cache dirs from orphan reclamation.
+      - ssd_links: ``{infohash: {link, ...}}`` for live symlinks that currently
+        resolve into the SSD cache (whether or not their bulk origin could be
+        recovered). Used to protect referenced cache dirs from orphan
+        reclamation and to detect links whose mapping is lost.
 
     `hot_bulk_maps[infohash]` is the persisted {link_path: bulk_path} map for
     torrents already promoted to SSD; passed through to resolve() so that the
@@ -89,7 +124,7 @@ async def _collect_instance(
     """
     snapshots: list[tuple[str, int, int]] = []
     resolved_list: list[ResolvedTorrent] = []
-    ssd_referenced: set[str] = set()
+    into_ssd: dict[str, set[str]] = {}
     async with QbitClient(
         name=instance.name,
         url=instance.url,
@@ -111,14 +146,15 @@ async def _collect_instance(
             )
             if r is not None:
                 resolved_list.append(r)
-            if references_ssd(
+            links = ssd_links(
                 torrent=t,
                 files=files,
                 ssd_cache_dir=config.ssd_cache_dir,
                 path_map=instance.path_map,
-            ):
-                ssd_referenced.add(t.hash)
-    return snapshots, resolved_list, ssd_referenced
+            )
+            if links:
+                into_ssd.setdefault(t.hash, set()).update(str(link) for link in links)
+    return snapshots, resolved_list, into_ssd
 
 
 def _aggregate_score(
@@ -301,48 +337,36 @@ def _cleanup_fs_orphans(
     return reclaimed
 
 
-def _evaluate_anomaly(config: Config, store: StateStore, ssd_referenced: set[str]) -> int:
-    """Set or clear the anomaly marker from the live tick view.
+def _untracked_ssd_bytes(config: Config, store: StateStore, infohashes: set[str]) -> int:
+    """SSD bytes held by quarantined torrents that the DB does not account for.
 
-    The unrecoverable case: a live symlink resolves into the SSD, but the
-    infohash is neither hot in the DB nor backed by a sidecar — so its
-    link→bulk mapping is lost and we cannot demote it cleanly. This is the
-    silent footgun made visible. With the live qB data in hand each tick, the
-    marker self-corrects: it is set while such a torrent exists and cleared
-    once it no longer does.
+    A torrent whose mapping is lost is not hot in the DB, so its SSD dir (if
+    it still exists) is invisible to ``hot_total_bytes``. Counting it here
+    keeps the quota honest — the original disk-full incident was exactly
+    promotions stacked on top of SSD content the DB had forgotten about.
     """
     hot = set(store.hot_infohashes())
-    unrecoverable = [
-        ih
-        for ih in sorted(ssd_referenced)
-        if ih not in hot and recovery.read_meta(config.ssd_cache_dir, ih) is None
-    ]
-    if config.dry_run:
-        return len(unrecoverable)
-    if unrecoverable:
-        recovery.set_anomaly(
-            config.ssd_cache_dir,
-            "live symlinks point into the SSD with no recoverable mapping:\n"
-            + "\n".join(unrecoverable),
-        )
-        log.error("tick.anomaly_present", count=len(unrecoverable))
-    else:
-        recovery.clear_anomaly(config.ssd_cache_dir)
-    return len(unrecoverable)
+    return sum(
+        recovery.ssd_dir_bytes(config.ssd_cache_dir / ih) for ih in infohashes if ih not in hot
+    )
 
 
-def _free_ssd_bytes(config: Config, store: StateStore) -> int:
+def _free_ssd_bytes(config: Config, store: StateStore, *, untracked_bytes: int = 0) -> int:
     """Bytes still spendable for new promotions."""
-    used = store.hot_total_bytes()
+    used = store.hot_total_bytes() + untracked_bytes
     quota_b = int(config.quota_gb * 1024**3)
     min_free_b = int(config.min_free_gb * 1024**3)
     free = shutil.disk_usage(config.ssd_cache_dir).free
     return max(0, min(quota_b - used, free - min_free_b))
 
 
-async def _tick(config: Config, store: StateStore) -> None:
+async def _tick(
+    config: Config, store: StateStore, runtime: DaemonRuntime | None = None
+) -> None:
+    rt = runtime if runtime is not None else DaemonRuntime.for_config(config)
     now = int(time.time())
     window_seconds = config.hotness.window_days * 86_400
+    await asyncio.to_thread(_heartbeat, config, now)
 
     # 1. Pre-load bulk_targets for every already-hot torrent so the resolver
     #    can recover bulk paths even when readlink() now points into the SSD.
@@ -355,7 +379,7 @@ async def _tick(config: Config, store: StateStore) -> None:
     )
 
     all_resolved: list[ResolvedTorrent] = []
-    ssd_referenced: set[str] = set()
+    into_ssd: dict[str, set[str]] = {}
     poll_ok = True
     for instance, result in zip(config.instances, instance_results, strict=True):
         if isinstance(result, BaseException):
@@ -363,7 +387,8 @@ async def _tick(config: Config, store: StateStore) -> None:
             poll_ok = False
             continue
         snapshots, resolved_list, refs = result
-        ssd_referenced |= refs
+        for ih, links in refs.items():
+            into_ssd.setdefault(ih, set()).update(links)
         for infohash, uploaded, upspeed in snapshots:
             await asyncio.to_thread(
                 store.record,
@@ -407,9 +432,24 @@ async def _tick(config: Config, store: StateStore) -> None:
         if orphans_dropped:
             log.info("tick.orphans_cleaned", count=orphans_dropped)
 
+    # 6b. Links into the SSD with a lost mapping: quarantine their torrents
+    #     for this tick and (only with a complete live view) update the marker.
+    unmapped = await asyncio.to_thread(
+        find_unmapped_links, config.ssd_cache_dir, store, into_ssd
+    )
+    quarantined = set(unmapped)
+    if poll_ok:
+        rt.anomaly.report(config.ssd_cache_dir, unmapped, now_ts=now, dry_run=config.dry_run)
+    active = [c for c in candidates if c.infohash not in quarantined]
+    untracked = (
+        await asyncio.to_thread(_untracked_ssd_bytes, config, store, quarantined)
+        if quarantined
+        else 0
+    )
+
     # 7. Demote first.
     demotions = select_demotions(
-        candidates,
+        active,
         now_ts=now,
         demote_max_mb=config.hotness.demote_max_upload_mb,
         min_hot_minutes=config.hotness.min_hot_minutes,
@@ -426,23 +466,30 @@ async def _tick(config: Config, store: StateStore) -> None:
     if demotions:
         log.info("tick.demoted", count=len(demotions))
 
-    # 7b. Reclaim orphaned SSD dirs + (re)evaluate the anomaly marker, but
-    #     only when every instance polled cleanly — a down instance would
-    #     make `ssd_referenced` incomplete and risk reclaiming a dir its
-    #     torrents still use.
+    # 7b. Reclaim orphaned SSD dirs, but only when every instance polled
+    #     cleanly — a down instance would make the referenced set incomplete
+    #     and risk reclaiming a dir its torrents still use.
     if poll_ok:
         reclaimed = await asyncio.to_thread(
-            _cleanup_fs_orphans, config, store, ssd_referenced
+            _cleanup_fs_orphans, config, store, set(into_ssd)
         )
         if reclaimed:
             log.info("tick.fs_orphans_reclaimed", count=reclaimed)
-        await asyncio.to_thread(_evaluate_anomaly, config, store, ssd_referenced)
     else:
         log.warning("tick.skip_orphan_reclaim_poll_incomplete")
 
     # 8. Recompute headroom.
-    available = await asyncio.to_thread(_free_ssd_bytes, config, store)
-    log.info("tick.headroom_bytes", bytes=available)
+    available = await asyncio.to_thread(
+        _free_ssd_bytes, config, store, untracked_bytes=untracked
+    )
+    log.info("tick.headroom_bytes", bytes=available, untracked_bytes=untracked)
+
+    if quarantined and config.suspend_promotions_on_anomaly:
+        # Fail-safe opt-in: while any mapping is lost, don't add anything new
+        # to the SSD. Demotions above still ran (they only free space).
+        log.warning("tick.promotions_suspended_anomaly", torrents=len(quarantined))
+        await asyncio.to_thread(_heartbeat, config, int(time.time()))
+        return
 
     max_size_bytes = (
         int(config.max_torrent_size_gb * 1024**3)
@@ -456,7 +503,7 @@ async def _tick(config: Config, store: StateStore) -> None:
     #     must beat its victim's density by displacement_factor). Eviction frees
     #     SSD without an HDD read; the promote step below fills the headroom.
     displacements = select_displacements(
-        candidates,
+        active,
         now_ts=now,
         available_bytes=available,
         promote_min_mb=config.hotness.promote_min_upload_mb,
@@ -478,12 +525,14 @@ async def _tick(config: Config, store: StateStore) -> None:
             store.set_tier(infohash=c.infohash, tier="cold", since_ts=now, ssd_bytes=0)
     if displacements:
         log.info("tick.displaced", count=len(displacements))
-        available = await asyncio.to_thread(_free_ssd_bytes, config, store)
+        available = await asyncio.to_thread(
+            _free_ssd_bytes, config, store, untracked_bytes=untracked
+        )
         log.info("tick.headroom_bytes", bytes=available, after="displace")
 
     # 9. Promote within headroom.
     promotions = select_promotions(
-        candidates,
+        active,
         now_ts=now,
         promote_min_mb=config.hotness.promote_min_upload_mb,
         min_cold_minutes=config.hotness.min_cold_minutes,
@@ -508,6 +557,7 @@ async def _tick(config: Config, store: StateStore) -> None:
             )
     if promotions:
         log.info("tick.promoted", count=len(promotions))
+    await asyncio.to_thread(_heartbeat, config, int(time.time()))
 
 
 async def run_daemon(config: Config) -> None:
@@ -524,6 +574,7 @@ async def run_daemon(config: Config) -> None:
         marker.touch()
 
     store = StateStore(config.state_db)
+    rt = DaemonRuntime.for_config(config)
 
     # Reconcile the DB against the filesystem before the first tick. This
     # rebuilds hot tier rows from the on-disk sidecars when the DB is fresh
@@ -531,6 +582,7 @@ async def run_daemon(config: Config) -> None:
     # promotions whose SSD copy disappeared. Anomalies it cannot repair are
     # surfaced via the healthcheck.
     await asyncio.to_thread(reconcile_startup, config, store)
+    _heartbeat(config, int(time.time()))
 
     stop = asyncio.Event()
 
@@ -541,7 +593,7 @@ async def run_daemon(config: Config) -> None:
     try:
         while not stop.is_set():
             try:
-                await _tick(config, store)
+                await _tick(config, store, rt)
             except Exception:
                 log.exception("tick.failed")
 

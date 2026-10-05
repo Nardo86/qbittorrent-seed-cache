@@ -75,6 +75,19 @@ class Config(BaseModel):
     # several small victims may be needed to free room for one larger torrent.
     max_displacements_per_tick: int = Field(8, gt=0)
 
+    # --- anomaly handling ---------------------------------------------------
+    # A live symlink into the SSD whose link->bulk mapping is lost is a data
+    # problem a restart cannot fix. It is reported via the anomaly marker and
+    # an error log line emitted when the affected set changes and then at most
+    # once per this interval (instead of once per file per tick).
+    anomaly_log_interval_sec: int = Field(3600, gt=0)
+    # Affected torrents are always quarantined (never promoted/demoted/
+    # displaced) and their untracked SSD bytes count against the quota. Set
+    # this to also stop *all* promotions/displacements while any anomaly is
+    # present (demotions keep running). Off by default: one broken torrent
+    # should not disable the whole cache until someone repairs it.
+    suspend_promotions_on_anomaly: bool = False
+
     @field_validator("instances")
     @classmethod
     def _unique_instance_names(cls, v: list[InstanceConfig]) -> list[InstanceConfig]:
