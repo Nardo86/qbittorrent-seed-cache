@@ -53,7 +53,9 @@ import asyncio
 import contextlib
 import shutil
 import signal
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import structlog
@@ -74,9 +76,15 @@ from .selector import (
     select_promotions,
 )
 from .state import StateStore
-from .symlinks import remove_tree
+from .symlinks import CopyInterrupted, remove_tree
 
 log = structlog.get_logger(__name__)
+
+# How long a partially-copied promotion (`.qbsc-promoting.json` present, no
+# sidecar yet) is kept for resumption while its torrent is still in qB.
+PROMOTION_RESUME_TTL_SEC = 24 * 3600
+_PROGRESS_BEAT_SEC = 30
+_PROGRESS_LOG_SEC = 60
 
 
 @dataclass
@@ -86,6 +94,10 @@ class DaemonRuntime:
     anomaly: AnomalyReporter = field(
         default_factory=lambda: AnomalyReporter(log_interval_sec=3600)
     )
+    # Set on SIGTERM/SIGINT. Long copies run in a worker thread that the
+    # event loop cannot cancel; they poll this between chunks so shutdown
+    # completes within Docker's stop timeout and keeps the partial file.
+    halt: threading.Event = field(default_factory=threading.Event)
 
     @classmethod
     def for_config(cls, config: Config) -> DaemonRuntime:
@@ -102,6 +114,24 @@ def _heartbeat(config: Config, now_ts: int) -> None:
     recovery.write_heartbeat(
         config.ssd_cache_dir, now_ts=now_ts, stale_after_ts=now_ts + grace
     )
+
+
+def _copy_progress(config: Config, infohash: str) -> Callable[[int, int], None]:
+    """Progress callback for a promotion copy: keeps the heartbeat fresh and
+    logs progress at a bounded rate (a 20 GB copy can take many minutes)."""
+    last_beat = last_log = time.monotonic()
+
+    def on_progress(done: int, total: int) -> None:
+        nonlocal last_beat, last_log
+        t = time.monotonic()
+        if t - last_beat >= _PROGRESS_BEAT_SEC:
+            _heartbeat(config, int(time.time()))
+            last_beat = t
+        if t - last_log >= _PROGRESS_LOG_SEC:
+            log.info("promote.copy_progress", infohash=infohash, done=done, bytes=total)
+            last_log = t
+
+    return on_progress
 
 
 async def _collect_instance(
@@ -308,7 +338,11 @@ def _cleanup_orphans(
 
 
 def _cleanup_fs_orphans(
-    config: Config, store: StateStore, ssd_referenced: set[str]
+    config: Config,
+    store: StateStore,
+    ssd_referenced: set[str],
+    live_infohashes: set[str] | None = None,
+    now_ts: int | None = None,
 ) -> int:
     """Reclaim `<ssd_cache_dir>/<infohash>/` dirs that nothing uses.
 
@@ -319,11 +353,34 @@ def _cleanup_fs_orphans(
     require it to be *unreferenced by any live symlink*, deleting it cannot
     dangle a seed. Reclaiming here (before the headroom recompute) returns the
     space to the promotion budget.
+
+    Exception: a dir holding an *interrupted promotion* (intent marker, no
+    sidecar yet) is kept while its torrent is still live in qB and the
+    first attempt is younger than ``PROMOTION_RESUME_TTL_SEC``, so the next
+    promotion resumes the partial copy instead of starting over. (Before
+    this, a restart mid-copy meant: reclaim the fragment, copy from zero,
+    get killed again — forever, for a 20 GB file.)
     """
     in_use = set(store.hot_infohashes()) | ssd_referenced
+    live = live_infohashes or set()
+    now = now_ts if now_ts is not None else int(time.time())
     reclaimed = 0
     for infohash, ssd_dir in recovery.iter_ssd_infohash_dirs(config.ssd_cache_dir):
         if infohash in in_use:
+            continue
+        started = recovery.read_promotion_intent_ts(config.ssd_cache_dir, infohash)
+        if (
+            started is not None
+            and infohash in live
+            and now - started < PROMOTION_RESUME_TTL_SEC
+            and recovery.read_meta(config.ssd_cache_dir, infohash) is None
+        ):
+            log.info(
+                "orphan.keep_pending_promotion",
+                infohash=infohash,
+                ssd_dir=str(ssd_dir),
+                age_sec=now - started,
+            )
             continue
         # If a sidecar survived, retarget any of its links back to bulk before
         # the rm. The dir is unreferenced by any *live* symlink, so this is a
@@ -488,7 +545,7 @@ async def _tick(
     #     and risk reclaiming a dir its torrents still use.
     if poll_ok:
         reclaimed = await asyncio.to_thread(
-            _cleanup_fs_orphans, config, store, set(into_ssd)
+            _cleanup_fs_orphans, config, store, set(into_ssd), set(logical), now
         )
         if reclaimed:
             log.info("tick.fs_orphans_reclaimed", count=reclaimed)
@@ -560,9 +617,23 @@ async def _tick(
         max_size_bytes=max_size_bytes,
     )
     for c in promotions:
+        if rt.halt.is_set():
+            break
         lt = logical[c.infohash]
         try:
-            await asyncio.to_thread(promote, lt.layouts, now_ts=now, dry_run=config.dry_run)
+            await asyncio.to_thread(
+                promote,
+                lt.layouts,
+                now_ts=now,
+                dry_run=config.dry_run,
+                stop=rt.halt,
+                on_progress=_copy_progress(config, c.infohash),
+            )
+        except CopyInterrupted as exc:
+            # Shutdown requested: the partial copy and the intent marker stay
+            # on disk; the next start resumes this promotion.
+            log.info("promote.interrupted", infohash=c.infohash, detail=str(exc))
+            break
         except Exception:
             log.exception("promote.failed", infohash=c.infohash)
             continue
@@ -605,9 +676,13 @@ async def run_daemon(config: Config) -> None:
 
     stop = asyncio.Event()
 
+    def _request_stop() -> None:
+        stop.set()
+        rt.halt.set()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+        loop.add_signal_handler(sig, _request_stop)
 
     try:
         while not stop.is_set():

@@ -6,11 +6,16 @@ own symlinks in its own `torrents/<release>/` dir; the mover retargets all
 of them in lockstep.
 
 Cold → Hot (`promote`):
+  0. Mark the `<infohash>/` dir as an in-progress promotion
+     (`.qbsc-promoting.json`) so a restart doesn't reclaim it as an orphan.
   1. For each unique SSD destination path among the layouts, copy bulk→SSD
-     once. The copy is atomic (tmp + rename) and skipped if the destination
-     already exists with the right size (resumes after a crash).
+     once. The copy is atomic (partial file + rename), skipped if the
+     destination already exists with the right size, and resumes a partial
+     file left by a killed process (same source, same boot). A stop request
+     interrupts it between chunks, keeping the partial.
   2. Write the recovery sidecar (`.qbsc-meta.json`) recording the
-     link→bulk mapping, *before* the symlinks are retargeted.
+     link→bulk mapping, *before* the symlinks are retargeted, then drop the
+     in-progress marker (from here on the sidecar describes the dir).
   3. Retarget every layout's symlink to its (absolute) SSD destination.
 
 The ordering of 2 before 3 is deliberate: the sidecar must be on disk
@@ -32,7 +37,8 @@ Both helpers expect every layout in the list to share the same infohash.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+import threading
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -126,17 +132,32 @@ def retarget_to_bulk(
     return fixed
 
 
-def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False) -> int:
+def promote(
+    layouts: list[TorrentLayout],
+    *,
+    now_ts: int,
+    dry_run: bool = False,
+    stop: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> int:
     """Promote a logical torrent to the SSD. Returns bytes copied (sum of unique destinations).
 
     Idempotent w.r.t. SSD content: if the SSD copy already exists with the
-    right size, only the symlinks are retargeted.
+    right size, only the symlinks are retargeted; a partial copy left by an
+    interrupted run is resumed.
 
     ``now_ts`` is stamped into the recovery sidecar as ``since_ts``.
+    ``stop``/``on_progress`` are passed to :func:`safe_copy`; a stop raises
+    :class:`~qbittorrent_seed_cache.symlinks.CopyInterrupted` before any
+    symlink is touched.
     """
     if not layouts:
         return 0
     infohash = _check_single_infohash(layouts)
+    # ssd_cache_dir is the parent of the <infohash> dir.
+    ssd_cache_dir = _ssd_root(layouts[0]).parent
+    if not dry_run:
+        recovery.write_promotion_intent(ssd_cache_dir, infohash=infohash, started_ts=now_ts)
 
     # Group by SSD destination to dedup copies across instances sharing the
     # same infohash.
@@ -164,13 +185,21 @@ def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False)
                 dry_run=dry_run,
             )
             if not dry_run:
-                safe_copy(layout.bulk_target, dest)
+                resumed_from = safe_copy(
+                    layout.bulk_target, dest, stop=stop, on_progress=on_progress
+                )
+                if resumed_from:
+                    log.info(
+                        "promote.copy_resumed",
+                        infohash=infohash,
+                        ssd=str(dest),
+                        resumed_from=resumed_from,
+                        bytes=size,
+                    )
         total += size
 
     # Write the recovery sidecar BEFORE retargeting any symlink, so a crash
-    # mid-retarget still leaves the filesystem self-describing. ssd_cache_dir
-    # is the parent of the <infohash> dir.
-    ssd_cache_dir = _ssd_root(layouts[0]).parent
+    # mid-retarget still leaves the filesystem self-describing.
     bulk_targets = bulk_targets_of(layouts)
     log.info(
         "promote.write_meta",
@@ -187,6 +216,7 @@ def promote(layouts: list[TorrentLayout], *, now_ts: int, dry_run: bool = False)
             ssd_bytes=total,
             bulk_targets=bulk_targets,
         )
+        recovery.clear_promotion_intent(ssd_cache_dir, infohash)
 
     for layout in layouts:
         log.info(

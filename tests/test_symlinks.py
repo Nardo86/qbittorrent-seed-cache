@@ -60,7 +60,7 @@ def test_safe_copy_atomic_leaves_no_tmp_on_failure(tmp_path: Path, monkeypatch: 
     def boom(*_a: object, **_kw: object) -> None:
         raise OSError("simulated copy failure")
 
-    monkeypatch.setattr(_shutil, "copyfile", boom)
+    monkeypatch.setattr(_shutil, "copystat", boom)
     with pytest.raises(OSError, match="simulated"):
         safe_copy(src, dest)
 

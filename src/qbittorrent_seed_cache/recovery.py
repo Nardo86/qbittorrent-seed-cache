@@ -39,6 +39,14 @@ anomaly marker file in the SSD cache dir (see
 and is surfaced by the healthcheck output, turning a silent data-integrity
 problem into a visible one that an operator can act on (``repair-dangling``).
 
+Promotion intent
+----------------
+``<infohash>/.qbsc-promoting.json`` is written when a promotion starts and
+removed once the recovery sidecar is on disk. While it is present (and the
+torrent is still live in qB) the tick's orphan reclaimer leaves the dir
+alone, so a promotion interrupted by a restart resumes instead of being
+thrown away and copied again from scratch.
+
 Heartbeat
 ---------
 The daemon refreshes ``.qbsc-heartbeat`` at every tick and while a long
@@ -64,10 +72,11 @@ META_NAME = ".qbsc-meta.json"
 META_SCHEMA_VERSION = 1
 ANOMALY_MARKER = ".qbsc-anomaly"
 HEARTBEAT_NAME = ".qbsc-heartbeat"
+PROMOTING_NAME = ".qbsc-promoting.json"
 
 # Bookkeeping files that live inside an ``<infohash>/`` dir but are not
 # cached payload.
-_INTERNAL_NAMES = frozenset({META_NAME})
+_INTERNAL_NAMES = frozenset({META_NAME, PROMOTING_NAME})
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,3 +294,37 @@ def read_heartbeat(ssd_cache_dir: Path) -> Heartbeat | None:
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
+
+# --- promotion intent -------------------------------------------------------
+
+
+def promotion_intent_path(ssd_cache_dir: Path, infohash: str) -> Path:
+    return ssd_cache_dir / infohash / PROMOTING_NAME
+
+
+def write_promotion_intent(ssd_cache_dir: Path, *, infohash: str, started_ts: int) -> None:
+    """Mark ``<infohash>/`` as an in-progress promotion (kept if already there).
+
+    An existing intent is left untouched so its ``started_ts`` keeps
+    measuring the age of the *first* attempt: a promotion that keeps failing
+    is eventually reclaimed instead of pinning its partial copy forever.
+    """
+    dest = promotion_intent_path(ssd_cache_dir, infohash)
+    if dest.is_file():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema_version": 1, "infohash": infohash, "started_ts": started_ts}
+    _atomic_write_json(dest, payload, fsync=False)
+
+
+def read_promotion_intent_ts(ssd_cache_dir: Path, infohash: str) -> int | None:
+    """``started_ts`` of the in-progress promotion of ``infohash``, if any."""
+    try:
+        with promotion_intent_path(ssd_cache_dir, infohash).open("r", encoding="utf-8") as fh:
+            return int(json.load(fh)["started_ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def clear_promotion_intent(ssd_cache_dir: Path, infohash: str) -> None:
+    promotion_intent_path(ssd_cache_dir, infohash).unlink(missing_ok=True)
