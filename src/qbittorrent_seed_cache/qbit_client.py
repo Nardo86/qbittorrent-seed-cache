@@ -99,3 +99,24 @@ class QbitClient:
         )
         r.raise_for_status()
         return list(r.json())
+
+    async def torrent_properties(self, infohash: str) -> dict[str, Any]:
+        assert self._client is not None
+        r = await self._client.get("/api/v2/torrents/properties", params={"hash": infohash})
+        r.raise_for_status()
+        return dict(r.json())
+
+    async def piece_hashes(self, infohash: str) -> list[str]:
+        """Hex piece hashes in piece order (SHA-1 for v1/hybrid torrents)."""
+        assert self._client is not None
+        r = await self._client.get("/api/v2/torrents/pieceHashes", params={"hash": infohash})
+        r.raise_for_status()
+        return [str(h) for h in r.json()]
+
+    async def recheck(self, infohashes: list[str]) -> None:
+        """Ask qB to re-verify the torrents' data (e.g. after `missingFiles`)."""
+        assert self._client is not None
+        r = await self._client.post(
+            "/api/v2/torrents/recheck", data={"hashes": "|".join(infohashes)}
+        )
+        r.raise_for_status()

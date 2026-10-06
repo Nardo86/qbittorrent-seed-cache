@@ -69,8 +69,18 @@ class TierRow:
 class StateStore:
     """Thin sync wrapper. Daemon code runs it via asyncio.to_thread."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
         self._path = path
+        if readonly:
+            # For tools running next to the daemon (repair-dangling): no
+            # schema/migration writes, no risk of touching the daemon's DB.
+            self._conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False: the daemon serializes SQLite access at the
         # event loop level but dispatches some queries through asyncio.to_thread,
