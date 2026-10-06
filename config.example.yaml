@@ -80,6 +80,11 @@ poll_interval_sec: 300
 # Where to store the rolling-window SQLite DB. Persists across restarts.
 state_db: /var/lib/seed-cache/state.db
 
+# Snapshots older than this are thinned (hourly) to one row per bucket, plus
+# the rows around qB restarts; the hotness score is unaffected. 0 disables.
+snapshot_full_resolution_hours: 24
+snapshot_bucket_minutes: 60
+
 # Logging: "json" for structlog JSON (good for container logs) or "console"
 # for human-friendly output during development.
 log_format: json
@@ -93,3 +98,11 @@ dry_run: false
 # Maximum number of concurrent promotions in one tick. Each promotion is
 # a sequential HDD read, so this is effectively the HDD parallelism.
 max_concurrent_promotions: 1
+
+# --- Anomalies (symlinks into the SSD whose link->bulk mapping is lost) ----
+# Affected torrents are always quarantined and listed in
+# <ssd_cache_dir>/.qbsc-anomaly; repair them with `repair-dangling`.
+# The error log line repeats at most this often while nothing changes.
+anomaly_log_interval_sec: 3600
+# true = also pause ALL promotions/displacements while any anomaly exists.
+suspend_promotions_on_anomaly: false

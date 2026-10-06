@@ -55,9 +55,24 @@ The SSD cache is disposable, but the `link → bulk file` mapping is not. It is 
 
 - **DB lost or replaced** → hot tier rows are rebuilt from the sidecars (no over-promoting on top of an SSD it forgot about).
 - **SSD dir deleted** → the affected symlinks are retargeted back to bulk and the tier row dropped.
-- **Both lost** → an anomaly marker is set and the container healthcheck goes **unhealthy** for manual repair.
+- **Both lost** (a live symlink into the SSD whose mapping is in neither place) → the affected torrents are **quarantined** (never promoted/demoted), an anomaly marker lists the links, and an error is logged when the set changes and then hourly. Repair them with [`repair-dangling`](#repairing-lost-mappings).
+- **Restart mid-promotion** → the partial copy is resumed, not thrown away (same source, same boot).
 
 See [State durability & recovery](docs/architecture.md#state-durability--recovery).
+
+### Healthcheck
+
+The image's healthcheck is a **liveness** check: it fails only if the SSD dir is missing/unwritable or the daemon's heartbeat (`.qbsc-heartbeat`, refreshed every tick and during long copies) is stale. A data anomaly is printed in the health output (`docker inspect --format '{{json .State.Health}}' seed-cache`) but does **not** make the container unhealthy, because a restart cannot fix it — with an `autoheal`-style sidecar it used to cause a kill/restart loop that also killed every in-flight promotion. Set `QBSC_HEALTHCHECK_FAIL_ON_ANOMALY=1` to fail on anomalies anyway (only if nothing auto-restarts on unhealthy).
+
+### Repairing lost mappings
+
+```bash
+docker exec seed-cache qbittorrent-seed-cache repair-dangling            # read-only table
+docker exec seed-cache qbittorrent-seed-cache repair-dangling --json     # same, JSON
+docker exec seed-cache qbittorrent-seed-cache repair-dangling --apply --recheck
+```
+
+For every symlink into the SSD with no known mapping, it looks for files of the exact same size under `managed_paths` and **verifies their content against the torrent's SHA-1 piece hashes** from qB. Only links with exactly one verified file (the media-library copy wins over an identical real copy inside another qB save dir) are retargeted by `--apply`, to a relative bulk symlink; nothing is deleted, real files are never touched, links changed since the scan are skipped. `--recheck` asks qB to recheck the fully-repaired torrents (they sit in `missingFiles`). The daemon clears the marker on its next tick.
 
 ## Quick start
 
@@ -105,6 +120,8 @@ poll_interval_sec: 300
 max_displacements_per_tick: 8
 ```
 
+The state DB keeps the hotness window (`window_days`); rows older than a day are thinned hourly to one per hour per torrent (exactly preserving the upload sums the score uses) and the file is VACUUMed when mostly free pages, so it stays in the tens-to-low-hundreds of MB instead of growing to GBs at a short poll interval.
+
 ## Setup helpers
 
 The [`tools/`](tools/) directory bundles one-shot helpers for the surrounding setup:
@@ -124,7 +141,9 @@ The [`tools/`](tools/) directory bundles one-shot helpers for the surrounding se
 | Quota & candidate selection     | ✅ per-infohash, multi-instance dedup |
 | Daemon loop                     | ✅ demote → displace → headroom → promote |
 | Crash / DB-loss recovery        | ✅ FS sidecars + startup reconciliation |
-| Tests                           | ✅ 68 pytest, incl. integration |
+| Lost-mapping repair             | ✅ `repair-dangling` (piece-hash verified, dry run by default) |
+| Resumable promotions            | ✅ partial copy survives restarts |
+| Tests                           | ✅ pytest, incl. integration |
 | CI / image publishing           | ✅ multi-arch (amd64, arm64) |
 
 ## Notes
